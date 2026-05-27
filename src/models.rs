@@ -209,7 +209,9 @@ pub struct BatchTxRequest {
 pub struct ContractSummary {
     pub contract_id: String,
     pub event_count: i64,
-    pub latest_ledger: i64,
+    pub first_seen_ledger: i64,
+    pub last_seen_ledger: i64,
+    pub last_event_at: DateTime<Utc>,
 }
 
 /// Aggregate statistics for indexed events.
@@ -258,6 +260,17 @@ impl PaginationParams {
         "anonymized",
     ];
     pub const MAX_CONTRACT_IDS_FILTER: usize = 20;
+
+    /// Validate a column name against the allowlist and structural constraints.
+    /// Returns true if valid, false otherwise.
+    pub fn validate_column_name(col: &str) -> bool {
+        // Check against allowlist
+        if !Self::ALLOWED_FIELDS.contains(&col) {
+            return false;
+        }
+        // Structural check: only lowercase letters and underscores
+        col.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+    }
 
     pub fn columns(&self) -> Result<Vec<&str>, (Vec<String>, Vec<&'static str>)> {
         match &self.fields {

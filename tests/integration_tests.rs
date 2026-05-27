@@ -655,3 +655,241 @@ async fn stats_requires_auth_when_key_configured(pool: PgPool) {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// --- GET /v1/events with empty DB ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_empty_db_returns_200_with_empty_data(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["page"], 1);
+    assert_eq!(body["limit"], 20);
+}
+
+// --- GET /v1/events/{contract_id} with invalid contract ID ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_by_contract_invalid_id_returns_400(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/contract/INVALID_CONTRACT_ID")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("invalid contract_id"));
+}
+
+// --- GET /v1/events/tx/{tx_hash} with valid hash ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_by_tx_hash_returns_200_with_empty_data_for_unknown_hash(pool: PgPool) {
+    let app = make_router(pool, None);
+    let tx_hash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/events/tx/{}", tx_hash))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_events_by_tx_hash_invalid_hash_returns_400(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/events/tx/invalid_hash")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- GET /openapi.json returns valid JSON ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn openapi_json_returns_valid_spec(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body.get("paths").is_some());
+    assert!(body.get("info").is_some());
+    assert_eq!(body["info"]["title"], "Soroban Pulse API");
+}
+
+// --- GET /v1/contracts endpoint ---
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_contracts_empty_db_returns_200_with_empty_data(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/contracts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total"], 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_contracts_returns_contract_list_with_counts(pool: PgPool) {
+    let contract_a = "CA23456789012345678901234567890123456789012345678901234567";
+    let contract_b = "CB23456789012345678901234567890123456789012345678901234567";
+
+    // Insert 3 events for contract A
+    for i in 0..3i64 {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, 'contract', $2, $3, NOW(), '{}'::jsonb)",
+        )
+        .bind(contract_a)
+        .bind(format!("{:0>63}{}", i, "a"))
+        .bind(100 + i)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Insert 2 events for contract B
+    for i in 0..2i64 {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, 'contract', $2, $3, NOW(), '{}'::jsonb)",
+        )
+        .bind(contract_b)
+        .bind(format!("{:0>63}{}", i, "b"))
+        .bind(200 + i)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/contracts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(body["total"], 2);
+
+    // Verify contract summaries have required fields
+    for contract in data {
+        assert!(contract.get("contract_id").is_some());
+        assert!(contract.get("event_count").is_some());
+        assert!(contract.get("first_seen_ledger").is_some());
+        assert!(contract.get("last_seen_ledger").is_some());
+        assert!(contract.get("last_event_at").is_some());
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_contracts_requires_auth_when_key_configured(pool: PgPool) {
+    let app = make_router(pool, Some("secret".to_string()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/contracts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deprecated_contracts_route_returns_deprecation_header(pool: PgPool) {
+    let app = make_router(pool, None);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/contracts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("Deprecation").unwrap(), "true");
+    assert!(resp
+        .headers()
+        .get("Link")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("/v1/contracts"));
+}
