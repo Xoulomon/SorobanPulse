@@ -41,6 +41,14 @@ enum IndexerFetchError {
     DbConnection(#[from] sqlx::Error),
 }
 
+/// Result of a fetch_and_store_events cycle containing both the next ledger to fetch
+/// and the latest ledger from the RPC response (to avoid redundant RPC calls).
+#[derive(Debug)]
+struct FetchResult {
+    next_ledger: u64,
+    latest_ledger: u64,
+}
+
 pub struct SorobanRpcClient {
     client: reqwest::Client,
     /// Custom headers injected into every RPC request. Values are never logged.
@@ -468,32 +476,27 @@ impl<R: RpcClient> Indexer<R> {
             }
 
             match self.fetch_and_store_events(current_ledger).await {
-                Ok(latest) => {
+                Ok(result) => {
                     consecutive_db_errors = 0;
                     // Update the last poll timestamp on success
                     if let Some(ref health_state) = self.health_state {
                         health_state.update_last_poll();
                     }
-                    if latest > current_ledger {
-                        current_ledger = latest;
+                    if result.next_ledger > current_ledger {
+                        current_ledger = result.next_ledger;
                         metrics::update_current_ledger(current_ledger);
                         if let Some(ref s) = self.indexer_state {
                             s.current_ledger
                                 .store(current_ledger, std::sync::atomic::Ordering::Relaxed);
                         }
 
-                        // Calculate and update lag
-                        let latest_ledger = self
-                            .rpc_client
-                            .get_latest_ledger(&self.config.stellar_rpc_url)
-                            .await
-                            .unwrap_or(0);
-                        if latest_ledger > current_ledger {
+                        // Use latest_ledger from RPC response to calculate lag (no extra RPC call)
+                        if result.latest_ledger > current_ledger {
                             if let Some(ref s) = self.indexer_state {
                                 s.latest_ledger
-                                    .store(latest_ledger, std::sync::atomic::Ordering::Relaxed);
+                                    .store(result.latest_ledger, std::sync::atomic::Ordering::Relaxed);
                             }
-                            let lag = latest_ledger - current_ledger;
+                            let lag = result.latest_ledger - current_ledger;
                             metrics::update_indexer_lag(lag);
 
                             // Warn if lag exceeds threshold
@@ -506,6 +509,14 @@ impl<R: RpcClient> Indexer<R> {
                             }
                         }
                     } else {
+                        // On idle cycles, refresh the latest_ledger metric
+                        if let Ok(latest) = self.rpc_client.get_latest_ledger(&self.config.stellar_rpc_url).await {
+                            if let Some(ref s) = self.indexer_state {
+                                s.latest_ledger.store(latest, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let lag = latest.saturating_sub(current_ledger);
+                            metrics::update_indexer_lag(lag);
+                        }
                         sleep(Duration::from_millis(self.config.indexer_poll_interval_ms)).await;
                     }
                 }
@@ -600,11 +611,12 @@ impl<R: RpcClient> Indexer<R> {
     pub async fn fetch_and_store_events_pub(&self, start_ledger: u64) -> Result<u64, String> {
         self.fetch_and_store_events(start_ledger)
             .await
+            .map(|result| result.next_ledger)
             .map_err(|e| e.to_string())
     }
 
     #[instrument(skip(self), fields(start_ledger = start_ledger))]
-    async fn fetch_and_store_events(&self, start_ledger: u64) -> Result<u64, IndexerFetchError> {
+    async fn fetch_and_store_events(&self, start_ledger: u64) -> Result<FetchResult, IndexerFetchError> {
         let cycle_start = std::time::Instant::now();
         // Resume from persisted cursor if available, otherwise start from ledger.
         let mut cursor: Option<String> = self.load_checkpoint().await;
@@ -771,11 +783,16 @@ impl<R: RpcClient> Indexer<R> {
             );
         }
 
-        if latest_ledger > start_ledger {
-            Ok(latest_ledger + 1)
+        let next_ledger = if latest_ledger > start_ledger {
+            latest_ledger + 1
         } else {
-            Ok(start_ledger)
-        }
+            start_ledger
+        };
+
+        Ok(FetchResult {
+            next_ledger,
+            latest_ledger,
+        })
     }
     fn validate_event_data(event: &SorobanEvent) -> bool {
         // Validate that value is an object or null
