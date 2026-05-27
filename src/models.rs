@@ -330,6 +330,9 @@ pub struct SorobanEvent {
     pub in_successful_call: bool,
     pub value: Value,
     pub topic: Option<Vec<Value>>,
+    /// Set by the indexer in multi-tenant mode; never serialized to JSON output.
+    #[serde(skip_serializing, default)]
+    pub tenant_id: Option<String>,
 }
 
 fn default_true() -> bool {
