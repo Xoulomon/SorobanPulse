@@ -223,6 +223,10 @@ Deprecation: true
 Link: </v1/events>; rel="successor-version"
 ```
 
+**Deprecation Timeline:**
+- **v0.x**: Unversioned routes remain functional with deprecation headers
+- **v1.0**: Unversioned routes will be removed
+
 Migrate to `/v1/` paths at your earliest convenience.
 
 ## How It Works

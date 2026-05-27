@@ -117,11 +117,73 @@ When adding new log statements, double-check that no field contains a raw secret
 - Run `make fmt` before pushing, or let the pre-commit hook handle it.
 - CI will reject any PR where `cargo fmt --check` fails.
 
+## Commit Message Format
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) to structure commit messages. This enables automated changelog generation and semantic versioning.
+
+### Format
+
+```
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
+```
+
+### Types
+
+- `feat:` A new feature
+- `fix:` A bug fix
+- `perf:` A performance improvement
+- `docs:` Documentation only
+- `chore:` Build, CI, or dependency updates
+- `refactor:` Code refactoring without feature changes
+- `test:` Adding or updating tests
+
+### Breaking Changes
+
+Prefix the footer with `BREAKING CHANGE:` to indicate a breaking change:
+
+```
+feat(api): change event response format
+
+BREAKING CHANGE: The /v1/events response now returns event_data as base64-encoded gzip by default.
+Use ?compact=false to get uncompressed JSON.
+```
+
+### Examples
+
+```
+feat(indexer): add Lua script transformation support
+
+- Load Lua scripts from configurable path
+- Transform events before storage
+- Skip events by returning nil
+
+Closes #123
+```
+
+```
+fix(handlers): prevent PII leakage in export endpoint
+
+Filter payments by patientId in addition to clinicId.
+
+Closes #456
+```
+
+```
+perf(db): add GIN index on event_data JSONB column
+
+Improves topic filtering query performance by 10x.
+```
+
 ## Pull Requests
 
 - Keep PRs focused — one logical change per PR.
 - Ensure `make test` and `make lint` pass locally before opening a PR.
 - Write a clear PR description referencing the relevant issue (e.g. `Closes #75`).
+- Use Conventional Commits for all commit messages in the PR.
 
 ## Releases
 
