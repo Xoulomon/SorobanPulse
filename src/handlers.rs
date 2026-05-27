@@ -1241,6 +1241,16 @@ pub async fn get_events(
             select_cols.push("id");
         }
 
+        // Defence-in-depth: re-validate each column before SQL interpolation
+        for col in &select_cols {
+            if !models::PaginationParams::validate_column_name(col) {
+                return Err(AppError::Validation(format!(
+                    "invalid column name: {}",
+                    col
+                )));
+            }
+        }
+
         let query_str = format!(
             "SELECT {} FROM events {} ORDER BY ledger {dir}, id {dir} LIMIT ${}",
             select_cols.join(", "),
@@ -1382,6 +1392,16 @@ pub async fn get_events(
     // Always fetch created_at for ETag computation
     if !select_cols.contains(&"created_at") {
         select_cols.push("created_at");
+    }
+
+    // Defence-in-depth: re-validate each column before SQL interpolation
+    for col in &select_cols {
+        if !models::PaginationParams::validate_column_name(col) {
+            return Err(AppError::Validation(format!(
+                "invalid column name: {}",
+                col
+            )));
+        }
     }
 
     let query_str = format!(
