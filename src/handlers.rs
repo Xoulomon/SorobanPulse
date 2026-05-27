@@ -2603,17 +2603,34 @@ pub async fn get_contracts(
     Ok(Json(result))
 }
 
-/// Replay events for a specific ledger range
+/// Query the min and max indexed ledger from the events table.
+/// Returns `(None, None)` when no events have been indexed yet.
+async fn get_indexed_ledger_range(
+    pool: &sqlx::PgPool,
+) -> Result<(Option<i64>, Option<i64>), AppError> {
+    let row = sqlx::query("SELECT MIN(ledger) AS min_ledger, MAX(ledger) AS max_ledger FROM events")
+        .fetch_one(pool)
+        .await?;
+    let min: Option<i64> = row.try_get("min_ledger")?;
+    let max: Option<i64> = row.try_get("max_ledger")?;
+    Ok((min, max))
+}
+
+/// Replay events for a specific ledger range.
+///
+/// The requested range is validated against the indexed window:
+/// - **400** if the range is entirely outside the indexed window (no overlap).
+/// - **202** with a `warning` field if the range is only partially indexed.
 #[utoipa::path(
     post,
     path = "/v1/admin/replay",
     tag = "admin",
     request_body(content = ReplayRequest, description = "Ledger range to replay", content_type = "application/json"),
     responses(
-        (status = 202, description = "Replay job accepted and queued"),
+        (status = 202, description = "Replay job accepted and queued. A `warning` field is included when the requested range is only partially covered by the indexed window."),
+        (status = 400, description = "Invalid request parameters, or the requested range is entirely outside the indexed window"),
         (status = 401, description = "Unauthorized - API key required"),
         (status = 403, description = "Forbidden - not the active indexer"),
-        (status = 400, description = "Invalid request parameters"),
     )
 )]
 pub async fn replay_events(
@@ -2655,6 +2672,63 @@ pub async fn replay_events(
         ));
     }
 
+    // Validate the requested range against the indexed window.
+    let from = request.from_ledger as i64;
+    let to = request.to_ledger as i64;
+
+    let warning: Option<String> =
+        match get_indexed_ledger_range(&state.pool).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })? {
+            (None, None) => {
+                // No events indexed at all — any range is entirely outside.
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "requested range is entirely outside the indexed window: no events have been indexed yet"
+                    })),
+                ));
+            }
+            (Some(min_indexed), Some(max_indexed)) => {
+                // Entirely before the indexed window.
+                if to < min_indexed {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!(
+                                "requested range [{from}, {to}] is entirely before the indexed window [{min_indexed}, {max_indexed}]"
+                            )
+                        })),
+                    ));
+                }
+                // Entirely after the indexed window (future ledgers).
+                if from > max_indexed {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!(
+                                "requested range [{from}, {to}] is entirely after the indexed window [{min_indexed}, {max_indexed}]"
+                            )
+                        })),
+                    ));
+                }
+                // Partial overlap — warn the caller.
+                if from < min_indexed || to > max_indexed {
+                    Some(format!(
+                        "requested range [{from}, {to}] is partially outside the indexed window [{min_indexed}, {max_indexed}]; only ledgers [{}, {}] will be replayed",
+                        from.max(min_indexed),
+                        to.min(max_indexed),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
     // Record the replay job metric
     crate::metrics::record_replay_job();
 
@@ -2670,14 +2744,16 @@ pub async fn replay_events(
         }
     });
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "message": "replay job accepted",
-            "from_ledger": request.from_ledger,
-            "to_ledger": request.to_ledger
-        })),
-    ))
+    let mut body = json!({
+        "message": "replay job accepted",
+        "from_ledger": request.from_ledger,
+        "to_ledger": request.to_ledger
+    });
+    if let Some(w) = warning {
+        body["warning"] = json!(w);
+    }
+
+    Ok((StatusCode::ACCEPTED, Json(body)))
 }
 
 /// Execute the replay job using the same fetch_and_store_events logic
@@ -5395,6 +5471,207 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["message"], "replay job accepted");
+    }
+
+    // ── Indexed range validation tests ───────────────────────────────────────
+
+    fn create_active_replay_router(pool: PgPool) -> axum::Router {
+        let health_state = Arc::new(HealthState::new(60));
+        let indexer_state = Arc::new(IndexerState::new());
+        indexer_state
+            .is_active_indexer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let prometheus_handle = crate::metrics::init_metrics();
+        let config = crate::config::Config::default();
+        crate::routes::create_router(
+            pool,
+            vec!["test-key".to_string()],
+            &[],
+            60,
+            health_state,
+            indexer_state,
+            prometheus_handle,
+            2000,
+            config,
+        )
+    }
+
+    async fn insert_events_at_ledgers(pool: &PgPool, ledgers: &[i64]) {
+        for (i, &ledger) in ledgers.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(format!("C{:0>55}", i))
+            .bind("contract")
+            .bind(format!("{:0>64}", i))
+            .bind(ledger)
+            .bind(Utc::now())
+            .bind(json!({}))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn post_replay(app: axum::Router, from: u64, to: u64) -> (StatusCode, Value) {
+        let body = serde_json::to_string(&ReplayRequest {
+            from_ledger: from,
+            to_ledger: to,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/replay")
+                    .header("Authorization", "Bearer test-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, v)
+    }
+
+    /// No events indexed → any range returns 400.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_validation_no_events_indexed_returns_400(pool: PgPool) {
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 100, 200).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("no events have been indexed"),
+            "unexpected error: {}",
+            v["error"]
+        );
+    }
+
+    /// Range entirely before the indexed window → 400.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_entirely_before_indexed_window_returns_400(pool: PgPool) {
+        // Indexed window: ledgers 500–1000
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 100, 400).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.contains("entirely before"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Range entirely after the indexed window (future ledgers) → 400.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_entirely_after_indexed_window_returns_400(pool: PgPool) {
+        // Indexed window: ledgers 500–1000
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 1001, 2000).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = v["error"].as_str().unwrap();
+        assert!(
+            err.contains("entirely after"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Range fully within the indexed window → 202, no warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_fully_within_indexed_window_returns_202_no_warning(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 500, 1000).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(v.get("warning").is_none(), "no warning expected for fully-covered range");
+    }
+
+    /// Range partially overlapping at the low end → 202 with warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_partial_overlap_low_end_returns_202_with_warning(pool: PgPool) {
+        // Indexed window: 500–1000; request starts before min
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 100, 800).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let warning = v["warning"].as_str().expect("warning field must be present");
+        assert!(
+            warning.contains("partially outside"),
+            "unexpected warning: {warning}"
+        );
+    }
+
+    /// Range partially overlapping at the high end → 202 with warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_partial_overlap_high_end_returns_202_with_warning(pool: PgPool) {
+        // Indexed window: 500–1000; request extends beyond max
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 800, 1500).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let warning = v["warning"].as_str().expect("warning field must be present");
+        assert!(
+            warning.contains("partially outside"),
+            "unexpected warning: {warning}"
+        );
+    }
+
+    /// Range spanning the entire indexed window and beyond on both sides → 202 with warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_spanning_beyond_both_ends_returns_202_with_warning(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 750, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 1, 9999).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            v["warning"].as_str().is_some(),
+            "warning field must be present"
+        );
+    }
+
+    /// Boundary: request exactly at min indexed ledger → 202, no warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_exact_min_boundary_returns_202_no_warning(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 500, 500).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(v.get("warning").is_none());
+    }
+
+    /// Boundary: request exactly at max indexed ledger → 202, no warning.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_exact_max_boundary_returns_202_no_warning(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 1000, 1000).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(v.get("warning").is_none());
+    }
+
+    /// Boundary: to_ledger == min_indexed - 1 → entirely before → 400.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_to_ledger_one_before_min_returns_400(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 400, 499).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("entirely before"));
+    }
+
+    /// Boundary: from_ledger == max_indexed + 1 → entirely after → 400.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replay_range_from_ledger_one_after_max_returns_400(pool: PgPool) {
+        insert_events_at_ledgers(&pool, &[500, 1000]).await;
+        let app = create_active_replay_router(pool);
+        let (status, v) = post_replay(app, 1001, 1500).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("entirely after"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
