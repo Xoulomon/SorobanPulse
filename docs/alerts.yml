@@ -108,3 +108,13 @@ groups:
         annotations:
           summary: "Soroban Pulse HTTP p95 request latency is high"
           description: "p95 request latency is {{ $value | humanizeDuration }}. Consider scaling or investigating database performance."
+
+      - alert: PodMemoryNearLimit
+        expr: soroban_pulse_process_memory_bytes / (512 * 1024 * 1024) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: resource
+        annotations:
+          summary: "Soroban Pulse pod memory is approaching the 512Mi limit"
+          description: "Process memory is {{ $value | humanizeBytes }} ({{ $value | humanizePercentage }} of the 512Mi limit). OOM kill risk if usage continues to grow. Consider increasing the memory limit or investigating leaks."

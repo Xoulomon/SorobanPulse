@@ -1,5 +1,40 @@
 # Deployment Guide
 
+## Resource Sizing
+
+### Recommended defaults
+
+| Resource | Request | Limit |
+| -------- | ------- | ----- |
+| CPU | `100m` | `1000m` |
+| Memory | `256Mi` | `512Mi` |
+
+These values are set in both `k8s/deployment.yaml` and `helm/soroban-pulse/values.yaml`. The Helm chart exposes the full `resources` block in `values.yaml` so you can override it without editing the template:
+
+```bash
+helm upgrade soroban-pulse ./helm/soroban-pulse \
+  --set resources.requests.memory=512Mi \
+  --set resources.limits.memory=1Gi \
+  --set resources.limits.cpu=2000m
+```
+
+### Tuning guidance
+
+- **CPU request (`100m`)** — the scheduler guarantee. Raise this if pods are consistently throttled (check `container_cpu_throttled_seconds_total`).
+- **CPU limit (`1000m`)** — caps one full core per pod. Increase for CPU-bound workloads (e.g. high event compression activity).
+- **Memory request (`256Mi`)** — raise to match observed steady-state RSS. Under-requesting causes the scheduler to place pods on nodes that later OOM.
+- **Memory limit (`512Mi`)** — pods that exceed this are OOM-killed. The `PodMemoryNearLimit` Prometheus alert (see `docs/alerts.yml`) fires when usage crosses 90% of this limit, giving you time to act before a kill occurs.
+
+### Memory alert
+
+The `PodMemoryNearLimit` alert in `docs/alerts.yml` fires when `soroban_pulse_process_memory_bytes` exceeds 90% of the 512 MiB limit for more than 5 minutes. Respond by:
+
+1. Checking for a memory leak (`kubectl top pod`, heap profiling).
+2. Increasing the limit and request if usage is legitimately growing with load.
+3. Scaling horizontally (`replicaCount` / HPA) to spread the load.
+
+---
+
 ## Healthcheck Configuration
 
 The `app` service in `docker-compose.yml` includes a Docker healthcheck that polls `GET /healthz/ready` every 10 seconds. The check is configured with:
