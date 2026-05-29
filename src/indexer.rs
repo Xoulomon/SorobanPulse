@@ -449,6 +449,7 @@ impl<R: RpcClient> Indexer<R> {
         let retry_interval = Duration::from_secs(self.config.indexer_lock_retry_secs.max(1));
         let mut interval = tokio::time::interval(retry_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let lock_wait_start = std::time::Instant::now();
 
         loop {
             // Respect shutdown signal while waiting to acquire the lock.
@@ -471,16 +472,36 @@ impl<R: RpcClient> Indexer<R> {
                 .unwrap_or(false);
 
             if acquired {
-                info!("Indexer lock acquired, starting indexing");
+                info!(
+                    lock_key = INDEXER_LOCK_KEY,
+                    "Indexer lock acquired, starting indexing"
+                );
                 if let Some(ref s) = self.indexer_state {
                     s.is_active_indexer.store(true, Ordering::Relaxed);
                 }
                 metrics::record_indexer_is_leader(true);
+                metrics::update_indexer_lock_wait_duration(0.0);
                 break;
             }
 
+            // Issue #427: Query pg_locks to find current lock holder's PID
+            let lock_holder_pid: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND objid = $1 LIMIT 1"
+            )
+            .bind(INDEXER_LOCK_KEY as i32)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+
+            let lock_wait_secs = lock_wait_start.elapsed().as_secs_f64();
+            metrics::update_indexer_lock_wait_duration(lock_wait_secs);
+
             warn!(
+                lock_key = INDEXER_LOCK_KEY,
+                lock_holder_pid = lock_holder_pid,
                 retry_secs = self.config.indexer_lock_retry_secs,
+                wait_secs = lock_wait_secs,
                 "Indexer lock not acquired, running in standby mode — will retry"
             );
             if let Some(ref s) = self.indexer_state {
@@ -725,7 +746,9 @@ impl<R: RpcClient> Indexer<R> {
         let mut latest_ledger = start_ledger;
         let mut total_fetched = 0;
         let mut total_inserted = 0;
-        let mut total_skipped = 0;
+        let mut total_skipped_duplicate = 0;
+        let mut total_skipped_validation = 0;
+        let mut total_skipped_out_of_order = 0;
         let mut total_pages = 0u32;
         let mut total_rpc_ms = 0u128;
         let mut total_db_ms = 0u128;
@@ -740,7 +763,7 @@ impl<R: RpcClient> Indexer<R> {
 
         loop {
             let rpc_start = std::time::Instant::now();
-            let result = match self
+            let mut result = match self
                 .rpc_client
                 .get_events(
                     &self.config.stellar_rpc_url,
@@ -760,6 +783,18 @@ impl<R: RpcClient> Indexer<R> {
             total_rpc_ms += rpc_start.elapsed().as_millis();
             total_pages += 1;
 
+            // Issue #426: Validate RPC response doesn't exceed max page size
+            let requested_limit = self.config.rpc_max_events_per_page;
+            if result.events.len() > requested_limit {
+                warn!(
+                    actual = result.events.len(),
+                    expected = requested_limit,
+                    "RPC response exceeded requested page size, truncating"
+                );
+                metrics::record_oversized_rpc_response();
+                result.events.truncate(requested_limit);
+            }
+
             latest_ledger = result.latest_ledger;
             let current_count = result.events.len();
             total_fetched += current_count;
@@ -770,6 +805,20 @@ impl<R: RpcClient> Indexer<R> {
             let mut db_tx = self.pool.begin().await?;
             let db_start = std::time::Instant::now();
             for event in result.events {
+                // Issue #428: Validate ledger sequence is monotonically increasing
+                if event.ledger < start_ledger {
+                    warn!(
+                        event_ledger = event.ledger,
+                        current_cursor = start_ledger,
+                        tx_hash = %event.tx_hash,
+                        contract_id = %event.contract_id,
+                        "Out-of-order event: ledger sequence below current cursor, skipping"
+                    );
+                    metrics::record_out_of_order_events(1);
+                    total_skipped_out_of_order += 1;
+                    continue;
+                }
+
                 // Apply Lua transformation if configured
                 #[cfg(feature = "lua")]
                 let event = if let Some(ref transformer) = self.lua_transformer {
@@ -777,7 +826,7 @@ impl<R: RpcClient> Indexer<R> {
                         Ok(Some(transformed)) => transformed,
                         Ok(None) => {
                             // Script returned nil, skip this event
-                            total_skipped += 1;
+                            total_skipped_validation += 1;
                             continue;
                         }
                         Err(e) => {
@@ -785,7 +834,7 @@ impl<R: RpcClient> Indexer<R> {
                                 error = %e,
                                 "Lua transformation failed, skipping event"
                             );
-                            total_skipped += 1;
+                            total_skipped_validation += 1;
                             continue;
                         }
                     }
@@ -800,7 +849,7 @@ impl<R: RpcClient> Indexer<R> {
                     Ok(rows) => {
                         total_inserted += rows;
                         if rows == 0 {
-                            total_skipped += 1;
+                            total_skipped_duplicate += 1;
                             // duplicate — skipped via ON CONFLICT DO NOTHING
                         } else {
                             if let Some(ref tx) = self.event_tx {
@@ -859,43 +908,30 @@ impl<R: RpcClient> Indexer<R> {
             }
         }
 
-        let cycle_ms = cycle_start.elapsed().as_millis();
-        if total_inserted > 0 {
-            info!(
-                fetched = total_fetched,
-                inserted = total_inserted,
-                start_ledger = start_ledger_for_log,
-                end_ledger = latest_ledger,
-                pages = total_pages,
-                cycle_ms = cycle_ms,
-                rpc_ms = total_rpc_ms,
-                db_ms = total_db_ms,
-                "Indexed ledger range",
-            );
-        } else {
-            tracing::debug!(
-                fetched = total_fetched,
-                inserted = total_inserted,
-                start_ledger = start_ledger_for_log,
-                end_ledger = latest_ledger,
-                pages = total_pages,
-                cycle_ms = cycle_ms,
-                rpc_ms = total_rpc_ms,
-                db_ms = total_db_ms,
-                "Indexed ledger range (no new events)",
-            );
-        }
-        metrics::record_events_indexed(total_inserted as u64);
+        let cycle_duration_secs = cycle_start.elapsed().as_secs_f64();
+        let cycle_ms = (cycle_duration_secs * 1000.0) as u128;
+        let lag_ledgers = latest_ledger.saturating_sub(start_ledger);
 
-        if total_fetched > 0 {
-            let duplicate_rate = (total_skipped as f64 / total_fetched as f64) * 100.0;
-            tracing::debug!(
-                duplicates = total_skipped,
-                total_fetched = total_fetched,
-                duplicate_rate = duplicate_rate,
-                "Event deduplication stats"
-            );
-        }
+        // Issue #425: Emit structured summary log at end of cycle
+        info!(
+            ledger = latest_ledger,
+            events_fetched = total_fetched,
+            events_inserted = total_inserted,
+            events_skipped_duplicate = total_skipped_duplicate,
+            events_skipped_validation = total_skipped_validation,
+            events_skipped_out_of_order = total_skipped_out_of_order,
+            cycle_duration_ms = cycle_ms,
+            lag_ledgers = lag_ledgers,
+            pages = total_pages,
+            rpc_ms = total_rpc_ms,
+            db_ms = total_db_ms,
+            "Indexer poll cycle completed"
+        );
+
+        // Issue #425: Record cycle duration and events per cycle metrics
+        metrics::record_indexer_cycle_duration(cycle_duration_secs);
+        metrics::record_indexer_events_per_cycle(total_inserted as u64);
+        metrics::record_events_indexed(total_inserted as u64);
 
         let next_ledger = if latest_ledger > start_ledger {
             latest_ledger + 1

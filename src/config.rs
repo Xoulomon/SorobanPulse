@@ -264,6 +264,8 @@ pub struct Config {
     pub sse_replay_limit: u64,
     // Issue #396: Indexer checkpoint persistence
     pub indexer_ignore_checkpoint: bool,
+    // Issue #426: Maximum events per RPC page
+    pub rpc_max_events_per_page: usize,
 }
 
 impl Default for Config {
@@ -1117,6 +1119,16 @@ impl Config {
                 &mut errors,
             )
             .unwrap_or(100_000),
+            indexer_ignore_checkpoint: env_or_file("INDEXER_IGNORE_CHECKPOINT", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(false),
+            rpc_max_events_per_page: parse_int::<usize>(
+                "RPC_MAX_EVENTS_PER_PAGE",
+                &env_or_file_or("RPC_MAX_EVENTS_PER_PAGE", &file, "200"),
+                "200",
+                &mut errors,
+            )
+            .unwrap_or(200),
         }
     }
 }
