@@ -152,12 +152,21 @@ pub struct Config {
     /// Optional read replica URL. When set, HTTP handlers use this pool; indexer uses primary.
     pub database_replica_url: Option<String>,
     pub stellar_rpc_url: String,
+    /// Optional ordered list of fallback RPC endpoints, tried when the primary
+    /// `stellar_rpc_url` fails. Each is validated with the same rules as the
+    /// primary URL. Set via the comma-separated STELLAR_RPC_FALLBACK_URLS env var.
+    pub stellar_rpc_fallback_urls: Vec<String>,
     /// Custom headers to inject into every RPC request (name, value). Values are never logged.
     pub rpc_headers: Vec<(String, String)>,
     pub start_ledger: u64,
     pub start_ledger_fallback: bool,
     pub port: u16,
     pub api_keys: Vec<SecretString>,
+    /// Admin API keys, independent of `api_keys`. Required to access
+    /// `/v1/admin/*` endpoints. Set via ADMIN_API_KEY (and optionally
+    /// ADMIN_API_KEY_SECONDARY for rotation). When empty, admin endpoints fall
+    /// back to the regular `api_keys` gate.
+    pub admin_api_keys: Vec<SecretString>,
     pub db_max_connections: u32,
     pub db_min_connections: u32,
     pub db_idle_timeout_secs: u64,
@@ -184,6 +193,8 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_secret: Option<String>,
     pub webhook_contract_filter: Vec<String>,
+    /// Require HTTPS for webhook URLs (default: false for development, true for production)
+    pub webhook_require_https: bool,
     /// Event types to index (empty = all types)
     pub indexer_event_types: Vec<String>,
     /// AES-GCM encryption key for event_data (32 bytes, hex-encoded)
@@ -263,11 +274,13 @@ impl Default for Config {
             database_url: "postgres://localhost/soroban_pulse".to_string(),
             database_replica_url: None,
             stellar_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            stellar_rpc_fallback_urls: Vec::new(),
             rpc_headers: Vec::new(),
             start_ledger: 0,
             start_ledger_fallback: false,
             port: 3000,
             api_keys: Vec::new(),
+            admin_api_keys: Vec::new(),
             db_max_connections: 10,
             db_min_connections: 2,
             db_idle_timeout_secs: 600,
@@ -329,17 +342,24 @@ impl Default for Config {
             pruning_interval_hours: 24,
             sse_replay_limit: 500,
             indexer_ignore_checkpoint: false,
-            rpc_max_events_per_page: 200,
+            webhook_require_https: false,
         }
     }
 }
 
 fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<String> {
+    validate_rpc_url_named("STELLAR_RPC_URL", raw, errors)
+}
+
+/// Validate a single RPC URL, attributing any errors to `var` (e.g.
+/// "STELLAR_RPC_URL" or "STELLAR_RPC_FALLBACK_URLS"). On success returns the
+/// URL with any embedded credentials stripped.
+fn validate_rpc_url_named(var: &str, raw: &str, errors: &mut Vec<String>) -> Option<String> {
     let url = match Url::parse(raw) {
         Ok(u) => u,
         Err(e) => {
             errors.push(format!(
-                "  STELLAR_RPC_URL={raw:?} is not a valid URL: {e}. \
+                "  {var}={raw:?} is not a valid URL: {e}. \
                  Expected a valid HTTPS URL (e.g., https://soroban-testnet.stellar.org)."
             ));
             return None;
@@ -355,7 +375,7 @@ fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<Strin
         "http" if allow_insecure => {}
         "http" => {
             errors.push(format!(
-                "  STELLAR_RPC_URL={raw:?} uses http. \
+                "  {var}={raw:?} uses http. \
                  Set ALLOW_INSECURE_RPC=true to permit insecure connections, \
                  or use an https URL (e.g., https://soroban-testnet.stellar.org)."
             ));
@@ -363,15 +383,23 @@ fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<Strin
         }
         scheme => {
             errors.push(format!(
-                "  STELLAR_RPC_URL={raw:?} has disallowed scheme '{scheme}'. \
+                "  {var}={raw:?} has disallowed scheme '{scheme}'. \
                  Only https is permitted (e.g., https://soroban-testnet.stellar.org)."
             ));
             return None;
         }
     }
 
+    let host = url.host_str().unwrap_or("");
+    if host.is_empty() {
+        errors.push(format!(
+            "  {var}={raw:?} has an empty host. \
+             Expected a valid HTTPS URL (e.g., https://soroban-testnet.stellar.org)."
+        ));
+        return None;
+    }
+
     if !allow_insecure {
-        let host = url.host_str().unwrap_or("");
         let is_loopback =
             host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".local");
         let is_private = host.starts_with("10.")
@@ -386,7 +414,7 @@ fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<Strin
             });
         if is_loopback || is_private {
             errors.push(format!(
-                "  STELLAR_RPC_URL={raw:?} points to a non-routable host '{host}'. \
+                "  {var}={raw:?} points to a non-routable host '{host}'. \
                  Set ALLOW_INSECURE_RPC=true to allow this in development."
             ));
             return None;
@@ -397,6 +425,21 @@ fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<Strin
     let _ = safe.set_username("");
     let _ = safe.set_password(None);
     Some(safe.to_string())
+}
+
+/// Parse and validate STELLAR_RPC_FALLBACK_URLS: a comma-separated list of
+/// fallback RPC endpoints used when the primary URL fails. Each entry is
+/// validated with the same rules as STELLAR_RPC_URL.
+fn parse_rpc_fallback_urls_checked(errors: &mut Vec<String>) -> Vec<String> {
+    let raw = match env::var("STELLAR_RPC_FALLBACK_URLS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Vec::new(),
+    };
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|u| validate_rpc_url_named("STELLAR_RPC_FALLBACK_URLS", u, errors))
+        .collect()
 }
 
 /// Read DATABASE_URL from DATABASE_URL_FILE if set, otherwise fall back to DATABASE_URL.
@@ -674,6 +717,8 @@ impl Config {
             validate_rpc_url_checked(&raw, &mut errors).unwrap_or_else(|| raw.clone())
         };
 
+        let stellar_rpc_fallback_urls = parse_rpc_fallback_urls_checked(&mut errors);
+
         let db_max_connections = parse_int::<u32>(
             "DB_MAX_CONNECTIONS",
             &env_or_file_or("DB_MAX_CONNECTIONS", &file, "10"),
@@ -912,14 +957,16 @@ impl Config {
         let rpc_headers = parse_rpc_headers_checked(&mut errors);
         let indexer_event_types = parse_indexer_event_types_checked(&mut errors);
 
-        // Report all errors at once.
+        // Report all errors at once, then exit with code 1 so operators get a
+        // clear, deterministic startup failure (a panic would exit with 101).
         if !errors.is_empty() {
             eprintln!(
                 "Configuration errors ({} found):\n{}",
                 errors.len(),
                 errors.join("\n")
             );
-            panic!("Startup aborted due to configuration errors. Fix the above and restart.");
+            eprintln!("Startup aborted due to configuration errors. Fix the above and restart.");
+            std::process::exit(1);
         }
 
         Self {
@@ -928,6 +975,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             stellar_rpc_url,
+            stellar_rpc_fallback_urls,
             rpc_headers,
             start_ledger,
             start_ledger_fallback,
@@ -938,6 +986,16 @@ impl Config {
                     keys.push(SecretString::new(key));
                 }
                 if let Some(key) = env_or_file("API_KEY_SECONDARY", &file) {
+                    keys.push(SecretString::new(key));
+                }
+                keys
+            },
+            admin_api_keys: {
+                let mut keys = Vec::new();
+                if let Some(key) = env_or_file("ADMIN_API_KEY", &file) {
+                    keys.push(SecretString::new(key));
+                }
+                if let Some(key) = env_or_file("ADMIN_API_KEY_SECONDARY", &file) {
                     keys.push(SecretString::new(key));
                 }
                 keys
@@ -972,6 +1030,9 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            webhook_require_https: env_or_file("WEBHOOK_REQUIRE_HTTPS", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or_else(|| environment.is_production_like()),
             indexer_event_types,
             event_data_encryption_key,
             event_data_encryption_key_old,
@@ -1197,6 +1258,81 @@ mod tests {
         let safe_db = config.safe_db_url();
         assert!(!safe_db.contains("supersecret"));
         assert!(!safe_db.contains("admin"));
+    }
+
+    // --- validate_rpc_url_checked ---
+
+    #[test]
+    fn validate_rpc_url_accepts_valid_https() {
+        let mut errors = Vec::new();
+        let out = validate_rpc_url_checked("https://soroban-testnet.stellar.org", &mut errors);
+        assert_eq!(
+            out.as_deref(),
+            Some("https://soroban-testnet.stellar.org/")
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_malformed() {
+        let mut errors = Vec::new();
+        // A typo like "htps://" parses as a URL with scheme "htps", which is
+        // rejected as a disallowed scheme.
+        let out = validate_rpc_url_checked("htps://soroban-testnet.stellar.org", &mut errors);
+        assert!(out.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("STELLAR_RPC_URL"));
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_garbage() {
+        let mut errors = Vec::new();
+        let out = validate_rpc_url_checked("not a url at all", &mut errors);
+        assert!(out.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("is not a valid URL"));
+    }
+
+    #[test]
+    fn validate_rpc_url_rejects_non_http_scheme() {
+        let mut errors = Vec::new();
+        let out = validate_rpc_url_checked("ftp://example.com", &mut errors);
+        assert!(out.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("disallowed scheme"));
+    }
+
+    #[test]
+    fn validate_rpc_url_strips_embedded_credentials() {
+        let mut errors = Vec::new();
+        let out = validate_rpc_url_checked("https://user:pass@rpc.example.com/", &mut errors);
+        let out = out.expect("valid url");
+        assert!(!out.contains("user"));
+        assert!(!out.contains("pass"));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_rpc_fallback_urls_empty_when_unset() {
+        env::remove_var("STELLAR_RPC_FALLBACK_URLS");
+        let mut errors = Vec::new();
+        assert!(parse_rpc_fallback_urls_checked(&mut errors).is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_rpc_fallback_urls_validates_each_entry() {
+        env::set_var(
+            "STELLAR_RPC_FALLBACK_URLS",
+            "https://rpc2.example.com, ftp://bad.example.com , https://rpc3.example.com",
+        );
+        let mut errors = Vec::new();
+        let urls = parse_rpc_fallback_urls_checked(&mut errors);
+        env::remove_var("STELLAR_RPC_FALLBACK_URLS");
+        // The two valid https entries are kept; the ftp entry produces one error.
+        assert_eq!(urls.len(), 2);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("STELLAR_RPC_FALLBACK_URLS"));
     }
 
     // --- parse_rpc_headers_checked ---

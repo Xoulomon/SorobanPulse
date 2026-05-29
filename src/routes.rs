@@ -93,6 +93,7 @@ pub struct AppState {
         handlers::stream_events_by_contract,
         handlers::stream_events_multi,
         handlers::ws_events,
+        handlers::ws_stream_events,
         handlers::get_contracts,
         handlers::replay_events,
         handlers::start_reencrypt,
@@ -105,6 +106,9 @@ pub struct AppState {
         handlers::get_contract_schema,
         handlers::delete_contract_schema,
         handlers::validate_event_data_against_schema,
+        handlers::start_mask_events,
+        handlers::get_mask_job_status,
+        handlers::get_timeseries,
     ),
     components(schemas(
         crate::models::Event,
@@ -120,6 +124,12 @@ pub struct AppState {
         crate::models::DiffParams,
         crate::models::ContractDiff,
         crate::models::DiffResponse,
+        crate::models::MaskEventsRequest,
+        crate::models::MaskEventsResponse,
+        crate::models::MaskJobStatus,
+        crate::models::TimeseriesParams,
+        crate::models::TimeseriesBucket,
+        crate::models::TimeseriesResponse,
         crate::error::ValidationErrorDetail,
     )),
     tags(
@@ -193,6 +203,7 @@ pub fn create_router_with_tx(
     config: crate::config::Config,
     schema_validator: Option<Arc<crate::schema_validator::SchemaValidator>>,
 ) -> Router {
+    let (_, shutdown_rx) = tokio::sync::watch::channel(false);
     create_router_with_tx_and_tenant_map(
         pool,
         read_pool,
@@ -212,6 +223,7 @@ pub fn create_router_with_tx(
         config,
         schema_validator,
         Arc::new(std::collections::HashMap::new()),
+        shutdown_rx,
     )
 }
 
@@ -240,11 +252,23 @@ pub fn create_router_with_tx_and_tenant_map(
 ) -> Router {
     let cors = build_cors(allowed_origins);
 
+    // Admin keys are independent of the regular API keys (issue #409).
+    let admin_api_keys: Vec<String> = {
+        use secrecy::ExposeSecret;
+        config
+            .admin_api_keys
+            .iter()
+            .map(|k| k.expose_secret().to_string())
+            .collect()
+    };
+
     let auth_state = Arc::new(middleware::AuthState {
         api_keys,
+        admin_api_keys: admin_api_keys.clone(),
         tenant_map: Arc::clone(&tenant_map),
         multi_tenant: config.multi_tenant,
     });
+    let admin_auth_state = Arc::new(middleware::AdminAuthState { admin_api_keys });
     let contract_count_cache = moka::future::Cache::builder()
         .max_capacity(config.contract_count_cache_size)
         .time_to_live(std::time::Duration::from_secs(
@@ -276,11 +300,41 @@ pub fn create_router_with_tx_and_tenant_map(
         shutdown_rx,
     };
 
+    // Spawn cache invalidation task: subscribe to the broadcast channel and
+    // evict the contract_count_cache entry whenever a new event is indexed.
+    {
+        let mut rx = app_state.event_tx.subscribe();
+        let cache = app_state.contract_count_cache.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                cache.invalidate(&event.contract_id).await;
+                crate::metrics::record_contract_count_cache_invalidation();
+            }
+        });
+    }
+
     // Build governor config: burst = rate_limit_per_minute, replenish 1 token per (60/rate) seconds.
     // per_second(n) means n tokens replenished per second; we want rate_limit_per_minute / 60.
     // Use per_millisecond to avoid integer truncation: replenish 1 token every (60_000 / rate) ms.
     let replenish_ms = 60_000u64 / u64::from(rate_limit_per_minute.max(1));
     let burst = rate_limit_per_minute.max(1);
+
+    // Admin routes (issue #409): gated by a dedicated admin auth layer in
+    // addition to the global auth layer. The admin layer requires an
+    // ADMIN_API_KEY even when no regular API_KEY is configured.
+    let admin_routes = Router::new()
+        .route("/admin/replay", axum::routing::post(handlers::replay_events))
+        .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
+        .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi))
+        .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
+        .route("/admin/indexer/pause", axum::routing::post(handlers::pause_indexer))
+        .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
+        .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))
+        .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&admin_auth_state),
+            middleware::admin_auth_middleware,
+        ));
 
     // Versioned v1 routes
     let v1 = Router::new()
@@ -288,10 +342,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/events/stats", get(handlers::get_event_stats))
         .route("/events/diff", get(handlers::get_events_diff))
         .route("/events/export", get(handlers::export_events))
+        .route("/events/timeseries", get(handlers::get_timeseries))
         .route("/events/recent", get(handlers::get_recent_events))
         .route("/events/stream", get(handlers::stream_events))
         .route("/events/stream/multi", get(handlers::stream_events_multi))
-        .route("/events/ws", get(handlers::ws_events))
+        .route("/events/ws", get(handlers::ws_stream_events))
         .route(
             "/events/contract/{contract_id}",
             get(handlers::get_events_by_contract),
@@ -304,6 +359,10 @@ pub fn create_router_with_tx_and_tenant_map(
             "/events/tx/batch",
             axum::routing::post(handlers::get_events_by_tx_batch),
         )
+        .route(
+            "/admin/events/bulk",
+            axum::routing::post(handlers::bulk_insert_events),
+        )
         .route("/events/tx/{tx_hash}", get(handlers::get_events_by_tx))
         .route(
             "/events/ledger-hash/{hash}",
@@ -312,8 +371,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/contracts", get(handlers::get_contracts))
         .route("/admin/replay", axum::routing::post(handlers::replay_events))
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
+        .route("/admin/mask-events", axum::routing::post(handlers::start_mask_events))
+        .route("/admin/mask-events/{job_id}", get(handlers::get_mask_job_status))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi))
         .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
+        .route("/admin/events/contract/{contract_id}", axum::routing::delete(handlers::delete_contract_events))
         .route("/admin/indexer/pause", axum::routing::post(handlers::pause_indexer))
         .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
         .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))
@@ -374,6 +436,7 @@ pub fn create_router_with_tx_and_tenant_map(
                 .per_millisecond(replenish_ms)
                 .burst_size(burst)
                 .key_extractor(SmartIpKeyExtractor)
+                .use_headers()
                 .finish()
                 .expect("invalid governor config"),
         );
@@ -399,6 +462,7 @@ pub fn create_router_with_tx_and_tenant_map(
                 .per_millisecond(replenish_ms)
                 .burst_size(burst)
                 .key_extractor(PeerIpKeyExtractor)
+                .use_headers()
                 .finish()
                 .expect("invalid governor config"),
         );
@@ -666,6 +730,7 @@ mod tests {
                 .per_millisecond(60_000u64 / u64::from(burst.max(1)))
                 .burst_size(burst)
                 .key_extractor(SmartIpKeyExtractor)
+                .use_headers()
                 .finish()
                 .expect("invalid governor config"),
         );
@@ -708,8 +773,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
-            resp.headers().contains_key("retry-after")
-                || resp.headers().contains_key("x-ratelimit-after")
+            resp.headers().contains_key("retry-after"),
+            "expected Retry-After header on 429"
+        );
+        assert!(
+            resp.headers().contains_key("x-ratelimit-limit"),
+            "expected X-RateLimit-Limit header on 429"
         );
     }
 

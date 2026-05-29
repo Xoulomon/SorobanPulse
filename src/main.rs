@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         rpc_url = %config.stellar_rpc_url,
+        rpc_fallback_urls = ?config.stellar_rpc_fallback_urls,
         rpc_headers = ?config.safe_rpc_headers(),
         start_ledger = config.start_ledger,
         port = config.port,

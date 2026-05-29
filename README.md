@@ -55,6 +55,7 @@ Open the newly created `.env` file in your editor and fill in your own real valu
 | `PORT`            | HTTP server port                     | `3000`                                   |
 | `RUST_LOG`        | Log verbosity level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 | `API_KEY`         | Optional key for API authentication  | (disabled)                               |
+| `ADMIN_API_KEY`   | Key required for `/v1/admin/*` endpoints (independent of `API_KEY`) | (disabled) |
 | `RUST_LOG_FORMAT` | Log output format (`text` or `json`) | `text`                                   |
 | `INDEXER_LAG_WARN_THRESHOLD` | Indexer lag warning threshold (ledgers) | `100`                                   |
 | `HEALTH_CHECK_TIMEOUT_MS`   | Timeout for the health check DB ping     | `2000`                                  |
@@ -65,6 +66,14 @@ Open the newly created `.env` file in your editor and fill in your own real valu
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry OTLP collector endpoint (when built with `otel` feature) | `http://localhost:4317` |
 
 > **Note on Authentication:** You can enable optional API key authentication by setting the `API_KEY` environment variable. When set, all requests (except `/health` and `/healthz/*` endpoints) will require either an `Authorization: Bearer <API_KEY>` or an `X-Api-Key: <API_KEY>` header. If `API_KEY` is unset or omitted from your configuration, authentication is bypassed and all requests pass through.
+
+> **Note on Admin Authentication:** The administrative endpoints under `/v1/admin/*` (pause/resume the indexer, replay, anonymize, schema/ABI management) are protected by a separate `ADMIN_API_KEY`, **independent of `API_KEY`**. This ensures admin operations stay locked down even if `API_KEY` is misconfigured or unset.
+>
+> - A request to an admin endpoint with **no key** returns **401 Unauthorized**.
+> - A request with a **regular `API_KEY`** (but not the admin key) returns **403 Forbidden**.
+> - A request with the **`ADMIN_API_KEY`** is allowed.
+>
+> Send the admin key the same way as a regular key (`Authorization: Bearer <ADMIN_API_KEY>` or `X-Api-Key: <ADMIN_API_KEY>`). Set `ADMIN_API_KEY_SECONDARY` to rotate the admin key without downtime. When `ADMIN_API_KEY` is unset, admin endpoints fall back to the regular `API_KEY` gate for backward compatibility.
 
 ### 3. Run with Docker Compose (easiest)
 

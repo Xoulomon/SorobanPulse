@@ -409,6 +409,45 @@ DATABASE_URL_FILE=/vault/secrets/database_url
 
 ---
 
+## Security Headers
+
+Every HTTP response is decorated with a set of hardening headers by the security
+headers middleware (`src/middleware.rs::security_headers_middleware`). These are
+applied automatically — no configuration is required.
+
+| Header | Value | Purpose |
+| --- | --- | --- |
+| `X-Content-Type-Options` | `nosniff` | Prevents MIME-type sniffing. |
+| `X-Frame-Options` | `DENY` | Blocks the response from being framed (clickjacking defense). |
+| `Referrer-Policy` | `no-referrer` | Never sends the `Referer` header to other origins. |
+| `Content-Security-Policy` | route-dependent (see below) | Restricts which resources the browser may load. |
+
+### Content-Security-Policy
+
+The CSP differs by route:
+
+- **API endpoints** (everything except `/docs`) return JSON only, so they get a
+  maximally strict policy:
+
+  ```
+  default-src 'none'; frame-ancestors 'none';
+  ```
+
+- **Swagger UI** (`GET /docs`) bootstraps with an inline `<script>` and loads the
+  Swagger UI assets from `unpkg.com`, so it gets a policy that permits inline
+  scripts/styles and the unpkg origin while still denying framing:
+
+  ```
+  default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';
+  ```
+
+> **Note:** the `'unsafe-inline'` and `unpkg.com` allowances exist solely so the
+> bundled Swagger UI renders. If you serve the documentation differently (e.g.
+> self-host the assets), tighten the `/docs` policy accordingly in
+> `security_headers_middleware`.
+
+---
+
 ## TLS Termination
 
 Soroban Pulse speaks plain HTTP and **must never be exposed directly on port 80 or 443 without TLS in front of it**. All TLS termination must happen at a reverse proxy or load balancer layer.

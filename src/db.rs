@@ -90,14 +90,28 @@ pub async fn run_migrations(pool: &PgPool) -> Result<usize, sqlx::migrate::Migra
             .map_err(sqlx::migrate::MigrateError::from)?;
         debug!(lock_id = MIGRATION_LOCK_ID, "Advisory lock acquired");
 
-        // Record which migrations are already applied before running.
-        let before: Vec<(String,)> =
-            sqlx::query_as("SELECT version::text FROM _sqlx_migrations WHERE success = true")
+        // Record which migrations are already applied before running, so we can
+        // identify exactly which ones this run applies.
+        let before: Vec<(i64,)> =
+            sqlx::query_as("SELECT version FROM _sqlx_migrations WHERE success = true")
                 .fetch_all(&mut *conn)
                 .await
                 .unwrap_or_default();
+        let before_versions: std::collections::HashSet<i64> =
+            before.iter().map(|(v,)| *v).collect();
 
         let result = sqlx::migrate!("./migrations").run(&mut *conn).await;
+
+        // Query the full migration ledger after running so we can log the
+        // version, description, and execution time of each newly applied one.
+        // execution_time is stored in nanoseconds by sqlx.
+        let after: Vec<(i64, String, i64)> = sqlx::query_as(
+            "SELECT version, description, execution_time \
+             FROM _sqlx_migrations WHERE success = true ORDER BY version",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_default();
 
         // Always release — ignore unlock errors so the migration result is returned.
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
@@ -108,16 +122,34 @@ pub async fn run_migrations(pool: &PgPool) -> Result<usize, sqlx::migrate::Migra
 
         result?;
 
-        // Count newly applied migrations by comparing before/after.
-        let after_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true")
-                .fetch_one(&mut *conn)
-                .await
-                .unwrap_or(before.len() as i64);
+        let newly_applied: Vec<&(i64, String, i64)> = after
+            .iter()
+            .filter(|(version, _, _)| !before_versions.contains(version))
+            .collect();
 
-        let newly_applied = (after_count as usize).saturating_sub(before.len());
-        info!(count = newly_applied, "Migrations applied");
-        Ok(newly_applied)
+        if newly_applied.is_empty() {
+            info!("No migrations to apply — schema is up to date");
+        } else {
+            for (version, description, execution_time_ns) in &newly_applied {
+                let execution_time_ms = (*execution_time_ns as f64) / 1_000_000.0;
+                info!(
+                    version = version,
+                    description = description.as_str(),
+                    execution_time_ms = execution_time_ms,
+                    "Applied migration"
+                );
+            }
+            info!(count = newly_applied.len(), "Migrations applied");
+        }
+
+        // Emit metrics: count of migrations applied this run, and the highest
+        // applied version currently in the schema.
+        crate::metrics::record_migrations_applied(newly_applied.len() as u64);
+        if let Some((max_version, _, _)) = after.iter().max_by_key(|(v, _, _)| *v) {
+            crate::metrics::set_last_migration_version(*max_version);
+        }
+
+        Ok(newly_applied.len())
     }
     .instrument(info_span!("db.run_migrations"))
     .await
@@ -146,11 +178,33 @@ mod tests {
             .expect("migrations must succeed");
         assert!(count > 0, "fresh database should have migrations applied");
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[sqlx::test(migrations = false)]
+    async fn run_migrations_logs_each_applied_then_reports_none_on_rerun(pool: PgPool) {
+        // First run on a fresh DB applies every migration and logs each one.
+        let first = run_migrations(&pool)
+            .await
+            .expect("first migration run must succeed");
+        assert!(first > 0, "fresh database should apply migrations");
+
+        // Second run finds the schema up to date: nothing new is applied and the
+        // "No migrations to apply" branch is taken.
+        let second = run_migrations(&pool)
+            .await
+            .expect("second migration run must succeed");
+        assert_eq!(
+            second, 0,
+            "re-running on an up-to-date schema should apply 0 migrations"
+        );
+
+        // The highest applied version should be queryable from the ledger.
+        let max_version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = true")
+                .fetch_one(&pool)
+                .await
+                .expect("ledger query must succeed");
+        assert!(max_version > 0, "a positive max migration version is expected");
+    }
 
     #[test]
     fn create_pool_signature_accepts_new_options() {

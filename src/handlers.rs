@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{info_span, instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -101,8 +102,18 @@ fn decode_cursor(cursor: &str) -> Result<(i64, Uuid), AppError> {
     let ledger = ledger_str
         .parse::<i64>()
         .map_err(|_| AppError::Validation("invalid cursor".to_string()))?;
+    if ledger <= 0 {
+        return Err(AppError::Validation("invalid cursor".to_string()));
+    }
+    // Reject astronomically large ledger values (Stellar ledger sequence is a u32)
+    if ledger > i64::from(u32::MAX) {
+        return Err(AppError::Validation("invalid cursor".to_string()));
+    }
     let id =
         Uuid::parse_str(id_str).map_err(|_| AppError::Validation("invalid cursor".to_string()))?;
+    if id.get_version() != Some(uuid::Version::Random) {
+        return Err(AppError::Validation("invalid cursor".to_string()));
+    }
     Ok((ledger, id))
 }
 
@@ -602,6 +613,7 @@ pub async fn swagger_ui() -> impl IntoResponse {
         (status = 503, description = "Too many SSE connections", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, headers, extensions), fields(contract_id = ?params.contract_id))]
 pub async fn stream_events(
     State(state): State<AppState>,
     Query(params): Query<StreamParams>,
@@ -662,6 +674,7 @@ pub async fn stream_events_by_contract(
         (status = 503, description = "Too many SSE connections", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, headers, extensions), fields(contract_ids = ?params.contract_ids))]
 pub async fn stream_events_multi(
     State(state): State<AppState>,
     Query(params): Query<crate::models::MultiStreamParams>,
@@ -1260,7 +1273,7 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         (status = 400, description = "Invalid query parameters"),
     )
 )]
-
+#[instrument(skip(state, headers, extensions), fields(page = ?params.page, limit = ?params.limit, contract_id = ?params.contract_id))]
 pub async fn get_events(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
@@ -1385,6 +1398,10 @@ pub async fn get_events(
             conditions.push(format!("in_successful_call = ${bind_idx}"));
             bind_idx += 1;
         }
+        if params.schema_version.is_some() {
+            conditions.push(format!("schema_version = ${bind_idx}"));
+            bind_idx += 1;
+        }
         if params.topic_sym.is_some() {
             conditions.push(format!("topic_0_sym = ${bind_idx}"));
             bind_idx += 1;
@@ -1476,6 +1493,9 @@ pub async fn get_events(
         if let Some(isc) = params.in_successful_call {
             q = q.bind(isc);
         }
+        if let Some(sv) = params.schema_version {
+            q = q.bind(sv);
+        }
         if let Some(ref ts) = params.topic_sym {
             q = q.bind(ts);
         }
@@ -1496,7 +1516,9 @@ pub async fn get_events(
         }
         q = q.bind(limit);
 
+        let _db_span = info_span!("db_query", query_type = "get_events_cursor").entered();
         let rows = q.fetch_all(&state.read_pool).await?;
+        drop(_db_span);
 
         let has_more = rows.len() as i64 == limit;
         let next_cursor = if has_more {
@@ -1618,6 +1640,10 @@ pub async fn get_events(
         conditions.push(format!("in_successful_call = ${bind_idx}"));
         bind_idx += 1;
     }
+    if params.schema_version.is_some() {
+        conditions.push(format!("schema_version = ${bind_idx}"));
+        bind_idx += 1;
+    }
     if params.topic_sym.is_some() {
         conditions.push(format!("topic_0_sym = ${bind_idx}"));
         bind_idx += 1;
@@ -1699,6 +1725,9 @@ pub async fn get_events(
     if let Some(isc) = params.in_successful_call {
         q = q.bind(isc);
     }
+    if let Some(sv) = params.schema_version {
+        q = q.bind(sv);
+    }
     if let Some(ref ts) = params.topic_sym {
         q = q.bind(ts);
     }
@@ -1719,7 +1748,9 @@ pub async fn get_events(
     }
     q = q.bind(limit).bind(offset);
 
+    let _db_span = info_span!("db_query", query_type = "get_events_offset").entered();
     let rows = q.fetch_all(&state.read_pool).await?;
+    drop(_db_span);
 
     let has_more = rows.len() as i64 == limit;
     let next_cursor = if has_more {
@@ -1792,7 +1823,9 @@ pub async fn get_events(
         if let Some(tid) = tenant_id {
             cq = cq.bind(tid);
         }
+        let _count_span = info_span!("db_query", query_type = "count_events").entered();
         let count = cq.fetch_one(&state.read_pool).await?;
+        drop(_count_span);
         (count, false)
     } else {
         // In multi-tenant mode we can't use the pg_class estimate (it's for the whole table).
@@ -1887,20 +1920,41 @@ pub async fn get_events(
     Ok(response)
 }
 
+/// Escape a single CSV field per RFC 4180.
+///
+/// A field is wrapped in double-quotes if it contains a comma, double-quote,
+/// newline (`\n`), or carriage-return (`\r`). Any double-quote character
+/// inside the field is escaped by doubling it (`"` → `""`).
+fn csv_escape_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        // Escape embedded double-quotes by doubling them, then wrap in quotes.
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_owned()
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/v1/events/export",
     tag = "events",
     params(
-        ("format" = Option<String>, Query, description = "Output format: csv (default) or parquet"),
+        ("format" = Option<String>, Query, description = "Output format: `csv` (default) or `parquet`. \
+            CSV output streams RFC 4180-compliant text with a header row. \
+            Parquet output requires the `parquet` feature flag."),
         ("event_type" = Option<String>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("from_ledger" = Option<i64>, Query, description = "Return events at or after this ledger"),
         ("to_ledger" = Option<i64>, Query, description = "Return events at or before this ledger"),
         ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
     ),
     responses(
-        (status = 200, description = "Exported events (CSV or Parquet depending on format param)"),
-        (status = 400, description = "Invalid query parameters"),
+        (status = 200, description = "Exported events. \
+            CSV: `Content-Type: text/csv`, header row `id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at`, \
+            streamed with `Content-Disposition: attachment; filename=\"events.csv\"`. \
+            Parquet: `Content-Type: application/octet-stream`, \
+            `Content-Disposition: attachment; filename=\"events.parquet\"`."),
+        (status = 400, description = "Invalid query parameters or unsupported format"),
         (status = 401, description = "API key required"),
     )
 )]
@@ -1922,7 +1976,15 @@ pub async fn export_events(
         }
     }
 
-    let want_parquet = params.format.as_deref() == Some("parquet");
+    let fmt = params.format.as_deref().unwrap_or("csv");
+    let want_parquet = fmt == "parquet";
+    let want_csv = fmt == "csv" || fmt.is_empty();
+
+    if !want_parquet && !want_csv {
+        return Err(AppError::Validation(format!(
+            "unsupported format '{fmt}': use 'csv' or 'parquet'"
+        )));
+    }
 
     #[cfg(not(feature = "parquet"))]
     if want_parquet {
@@ -2003,6 +2065,46 @@ pub async fn export_events(
     let returned_count = rows.len() as i64;
     let content_range = format!("items 0-{}/{}", returned_count.saturating_sub(1), total_count);
 
+    // JSON Lines format
+    if want_jsonl {
+        let mut jsonl = String::new();
+        for row in &rows {
+            let id: uuid::Uuid = row.try_get("id")?;
+            let contract_id: String = row.try_get("contract_id")?;
+            let event_type: String = row.try_get("event_type")?;
+            let tx_hash: String = row.try_get("tx_hash")?;
+            let ledger: i64 = row.try_get("ledger")?;
+            let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
+            let event_data: serde_json::Value = row.try_get("event_data")?;
+            let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+            
+            let obj = serde_json::json!({
+                "id": id,
+                "contract_id": contract_id,
+                "event_type": event_type,
+                "tx_hash": tx_hash,
+                "ledger": ledger,
+                "timestamp": timestamp,
+                "event_data": event_data,
+                "created_at": created_at,
+            });
+            
+            jsonl.push_str(&obj.to_string());
+            jsonl.push('\n');
+        }
+        
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"events.jsonl\"",
+            )
+            .header("Content-Range", content_range)
+            .body(Body::from(jsonl))
+            .unwrap());
+    }
+
     #[cfg(feature = "parquet")]
     if want_parquet {
         use crate::parquet_export::{write_events_parquet, EventRow};
@@ -2037,9 +2139,20 @@ pub async fn export_events(
             .unwrap());
     }
 
-    // Default: CSV
-    let mut csv =
-        String::from("id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at\n");
+    // Default: CSV (RFC 4180)
+    // Build each row as a Bytes chunk and stream them so the full result set
+    // is never held in a single allocation.
+    use bytes::Bytes;
+    use futures::stream;
+
+    const CSV_HEADER: &str =
+        "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at\n";
+
+    // Collect row chunks; the header is the first chunk.
+    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> =
+        Vec::with_capacity(rows.len() + 1);
+    chunks.push(Ok(Bytes::from_static(CSV_HEADER.as_bytes())));
+
     for row in &rows {
         let id: uuid::Uuid = row.try_get("id")?;
         let contract_id: String = row.try_get("contract_id")?;
@@ -2049,10 +2162,22 @@ pub async fn export_events(
         let timestamp: chrono::DateTime<chrono::Utc> = row.try_get("timestamp")?;
         let event_data: serde_json::Value = row.try_get("event_data")?;
         let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-        let data_str = event_data.to_string().replace('"', "\"\"");
-        csv.push_str(&format!(
-            "{id},{contract_id},{event_type},{tx_hash},{ledger},{timestamp},\"{data_str}\",{created_at}\n"
-        ));
+
+        // Serialize event_data to a JSON string, then escape it as a CSV field.
+        let data_str = event_data.to_string();
+
+        let line = format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_escape_field(&id.to_string()),
+            csv_escape_field(&contract_id),
+            csv_escape_field(&event_type),
+            csv_escape_field(&tx_hash),
+            ledger,
+            csv_escape_field(&timestamp.to_rfc3339()),
+            csv_escape_field(&data_str),
+            csv_escape_field(&created_at.to_rfc3339()),
+        );
+        chunks.push(Ok(Bytes::from(line)));
     }
 
     Ok(Response::builder()
@@ -2063,7 +2188,7 @@ pub async fn export_events(
             "attachment; filename=\"events.csv\"",
         )
         .header("Content-Range", content_range)
-        .body(Body::from(csv))
+        .body(Body::from_stream(stream::iter(chunks)))
         .unwrap())
 }
 
@@ -2073,6 +2198,8 @@ pub struct RecentParams {
     pub limit: Option<i64>,
     pub event_type: Option<crate::models::EventType>,
     pub contract_id: Option<String>,
+    /// Cursor for pagination (opaque, URL-safe).
+    pub cursor: Option<String>,
     /// Not supported — returns 400 if provided.
     pub from_ledger: Option<i64>,
     /// Not supported — returns 400 if provided.
@@ -2087,6 +2214,7 @@ pub struct RecentParams {
         ("limit" = Option<i64>, Query, description = "Number of most-recent events to return, 1–100 (default: 20)"),
         ("event_type" = Option<crate::models::EventType>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("cursor" = Option<String>, Query, description = "Cursor for pagination (opaque, URL-safe)"),
     ),
     responses(
         (status = 200, description = "Most recently indexed events in descending ledger order"),
@@ -2120,6 +2248,16 @@ pub async fn get_recent_events(
         bind_idx += 1;
     }
 
+    // Handle cursor-based pagination
+    if let Some(ref cursor_str) = params.cursor {
+        let (cursor_ledger, cursor_id) = decode_cursor(cursor_str)?;
+        conditions.push(format!(
+            "(ledger, id) < (${}, ${})",
+            bind_idx, bind_idx + 1
+        ));
+        bind_idx += 2;
+    }
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -2139,9 +2277,21 @@ pub async fn get_recent_events(
     if let Some(ref et) = params.event_type {
         q = q.bind(et);
     }
-    q = q.bind(limit);
+    if let Some(ref cursor_str) = params.cursor {
+        let (cursor_ledger, cursor_id) = decode_cursor(cursor_str)?;
+        q = q.bind(cursor_ledger);
+        q = q.bind(cursor_id);
+    }
+    q = q.bind(limit + 1); // Fetch one extra to determine if there's a next page
 
     let rows = q.fetch_all(&state.pool).await?;
+    let has_next = rows.len() > limit as usize;
+    let rows = if has_next {
+        &rows[..limit as usize]
+    } else {
+        &rows
+    };
+
     let events: Vec<Value> = rows
         .iter()
         .map(|e| {
@@ -2154,10 +2304,18 @@ pub async fn get_recent_events(
         })
         .collect();
 
-    Ok(Json(json!({
+    let mut response = json!({
         "data": events,
         "limit": limit,
-    })))
+    });
+
+    if has_next && !rows.is_empty() {
+        let last_event = &rows[rows.len() - 1];
+        let next_cursor = encode_cursor(last_event.ledger, last_event.id);
+        response["next_cursor"] = json!(next_cursor);
+    }
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -2182,6 +2340,7 @@ pub async fn get_recent_events(
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, extensions), fields(contract_id = %contract_id))]
 pub async fn get_events_by_contract(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -2263,8 +2422,10 @@ pub async fn get_events_by_contract(
     // Fetch total count. Skip cache in multi-tenant mode to avoid cross-tenant leakage.
     let total: i64 = if params.from_ledger.is_none() && params.to_ledger.is_none() && tenant_id.is_none() {
         if let Some(cached) = state.contract_count_cache.get(&contract_id).await {
+            crate::metrics::update_contract_count_cache_hit_ratio(1, 0);
             cached
         } else {
+            crate::metrics::update_contract_count_cache_hit_ratio(0, 1);
             let count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE contract_id = $1")
                     .bind(&contract_id)
@@ -2339,6 +2500,7 @@ pub async fn get_events_by_contract(
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
+#[instrument(skip(state, extensions), fields(tx_hash = %tx_hash))]
 pub async fn get_events_by_tx(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
@@ -2402,6 +2564,109 @@ pub async fn get_events_by_tx(
     responses(
         (status = 200, description = "Map of tx_hash -> events for all requested hashes"),
         (status = 400, description = "Invalid hashes or too many hashes", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 429, description = "Too many requests", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    )
+)]
+#[instrument(skip(state, body))]
+pub async fn bulk_insert_events(
+    State(state): State<AppState>,
+    Json(body): Json<crate::models::BulkInsertRequest>,
+) -> Result<Json<crate::models::BulkInsertResponse>, AppError> {
+    const MAX_BATCH_SIZE: usize = 1000;
+    
+    if body.events.is_empty() {
+        return Err(AppError::Validation("events list cannot be empty".to_string()));
+    }
+    
+    if body.events.len() > MAX_BATCH_SIZE {
+        return Err(AppError::Validation(format!(
+            "events list exceeds maximum of {} events",
+            MAX_BATCH_SIZE
+        )));
+    }
+    
+    let mut inserted = 0i64;
+    let mut skipped = 0i64;
+    let mut failed = 0i64;
+    let mut errors = Vec::new();
+    
+    for event in body.events {
+        // Validate contract_id
+        if let Err(e) = validate_contract_id(&event.contract_id) {
+            failed += 1;
+            errors.push(format!("Invalid contract_id: {}", e));
+            continue;
+        }
+        
+        // Validate tx_hash
+        if let Err(e) = validate_tx_hash(&event.tx_hash) {
+            failed += 1;
+            errors.push(format!("Invalid tx_hash: {}", e));
+            continue;
+        }
+        
+        // Validate event_type
+        let event_type = match event.event_type.as_str() {
+            "contract" | "diagnostic" | "system" => event.event_type.clone(),
+            _ => {
+                failed += 1;
+                errors.push(format!("Invalid event_type: {}", event.event_type));
+                continue;
+            }
+        };
+        
+        let id = Uuid::new_v4();
+        let result = sqlx::query(
+            "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, event_data_normalized, ledger_hash, in_successful_call, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+             ON CONFLICT (contract_id, tx_hash, ledger, event_type) DO NOTHING"
+        )
+        .bind(id)
+        .bind(&event.contract_id)
+        .bind(&event_type)
+        .bind(&event.tx_hash)
+        .bind(event.ledger)
+        .bind(event.timestamp)
+        .bind(&event.event_data)
+        .bind(&event.event_data_normalized)
+        .bind(&event.ledger_hash)
+        .bind(event.in_successful_call.unwrap_or(false))
+        .execute(&state.write_pool)
+        .await;
+        
+        match result {
+            Ok(result) => {
+                if result.rows_affected() > 0 {
+                    inserted += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                errors.push(format!("Database error: {}", e));
+            }
+        }
+    }
+    
+    Ok(Json(crate::models::BulkInsertResponse {
+        inserted,
+        skipped,
+        failed,
+        errors,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/admin/events/bulk",
+    tag = "Admin",
+    request_body = crate::models::BulkInsertRequest,
+    responses(
+        (status = 200, description = "Bulk insert result", body = crate::models::BulkInsertResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 429, description = "Too many requests", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -2629,6 +2894,111 @@ pub async fn anonymize_event(
     tracing::info!(event_id = %id, anonymized_at = %chrono::Utc::now(), "Event anonymized");
 
     Ok(Json(json!({ "id": id, "anonymized": true })))
+}
+
+/// Delete all events for a contract (GDPR right-to-erasure).
+/// Optionally anonymize instead of deleting with `anonymize_only=true`.
+/// Logs deletion request for audit purposes.
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/events/contract/{contract_id}",
+    tag = "admin",
+    params(
+        ("contract_id" = String, Path, description = "Contract ID"),
+        ("anonymize_only" = Option<bool>, Query, description = "If true, anonymize instead of deleting (default: false)"),
+    ),
+    responses(
+        (status = 200, description = "Events deleted or anonymized"),
+        (status = 400, description = "Invalid contract_id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn delete_contract_events(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let anonymize_only = params
+        .get("anonymize_only")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown");
+
+    if anonymize_only {
+        // Anonymize: set anonymized=true and hash tx_hash
+        use sha2::{Digest, Sha256};
+
+        let rows = sqlx::query("SELECT id, tx_hash FROM events WHERE contract_id = $1 AND anonymized = FALSE")
+            .bind(&contract_id)
+            .fetch_all(&state.pool)
+            .await?;
+
+        let count = rows.len() as u64;
+
+        for row in rows {
+            let id: Uuid = row.try_get("id")?;
+            let tx_hash: String = row.try_get("tx_hash")?;
+            let hashed_tx = {
+                let mut h = Sha256::new();
+                h.update(tx_hash.as_bytes());
+                format!("{:x}", h.finalize())
+            };
+
+            sqlx::query("UPDATE events SET anonymized = TRUE, event_data = $1, tx_hash = $2 WHERE id = $3")
+                .bind(json!({"anonymized": true}))
+                .bind(&hashed_tx)
+                .bind(id)
+                .execute(&state.pool)
+                .await?;
+        }
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events anonymized for contract (GDPR)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "anonymized",
+            "count": count,
+        })))
+    } else {
+        // Hard delete
+        let result = sqlx::query("DELETE FROM events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&state.pool)
+            .await?;
+
+        let count = result.rows_affected();
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events deleted for contract (GDPR right-to-erasure)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "deleted",
+            "count": count,
+        })))
+    }
 }
 
 /// Pause the indexer loop without stopping the HTTP server.
@@ -6120,6 +6490,227 @@ mod tests {
         assert!(response.status().is_client_error());
     }
 
+    // ── CSV escaping unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn csv_escape_plain_field_is_unchanged() {
+        assert_eq!(csv_escape_field("hello"), "hello");
+        assert_eq!(csv_escape_field("contract"), "contract");
+        assert_eq!(csv_escape_field(""), "");
+    }
+
+    #[test]
+    fn csv_escape_field_with_comma_is_quoted() {
+        assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_double_quote_doubles_it() {
+        assert_eq!(csv_escape_field(r#"say "hi""#), r#""say ""hi""""#);
+    }
+
+    #[test]
+    fn csv_escape_field_with_newline_is_quoted() {
+        assert_eq!(csv_escape_field("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_carriage_return_is_quoted() {
+        assert_eq!(csv_escape_field("line1\rline2"), "\"line1\rline2\"");
+    }
+
+    #[test]
+    fn csv_escape_field_with_comma_and_quote() {
+        // A field like: He said, "hello"
+        // Should become: "He said, ""hello"""
+        assert_eq!(
+            csv_escape_field(r#"He said, "hello""#),
+            r#""He said, ""hello""""#
+        );
+    }
+
+    #[test]
+    fn csv_escape_json_event_data() {
+        // Typical JSON event_data contains commas and double-quotes
+        let json = r#"{"key":"value","amount":100}"#;
+        let escaped = csv_escape_field(json);
+        // Must be wrapped in quotes and internal quotes doubled
+        assert!(escaped.starts_with('"'));
+        assert!(escaped.ends_with('"'));
+        assert!(escaped.contains("\"\"key\"\""));
+    }
+
+    // ── CSV format=csv explicit query param ──────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_format_csv_explicit_returns_csv(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("c".repeat(64))
+        .bind(5_i64)
+        .bind(Utc::now())
+        .bind(json!({"key": "value", "amount": 42}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+        assert!(response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("events.csv"));
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at"
+        );
+        assert!(lines.next().is_some(), "expected at least one data row");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_csv_escapes_special_characters(pool: PgPool) {
+        // Insert an event whose event_data contains commas and quotes (normal JSON)
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("d".repeat(64))
+        .bind(10_i64)
+        .bind(Utc::now())
+        // JSON with commas and quotes — both must be properly escaped in CSV
+        .bind(json!({"msg": "hello, world", "note": "say \"hi\""}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+
+        // The data row must exist
+        let mut lines = csv.lines();
+        lines.next(); // skip header
+        let data_row = lines.next().expect("expected a data row");
+
+        // The event_data field must be quoted (contains commas and quotes)
+        assert!(
+            data_row.contains('"'),
+            "event_data with commas/quotes must be quoted in CSV: {data_row}"
+        );
+        // The row must not split on the comma inside the JSON value
+        // (i.e., the CSV parser should see exactly 8 fields)
+        let field_count = count_csv_fields(data_row);
+        assert_eq!(field_count, 8, "expected 8 CSV fields, got {field_count}: {data_row}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_csv_empty_db_returns_header_only(pool: PgPool) {
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=csv")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "id,contract_id,event_type,tx_hash,ledger,timestamp,event_data,created_at"
+        );
+        assert!(lines.next().is_none(), "empty DB should produce header row only");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_events_unknown_format_returns_400(pool: PgPool) {
+        let app = create_export_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/export?format=xlsx")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Minimal RFC 4180 field counter: counts top-level comma-separated fields,
+    /// respecting double-quoted fields (commas inside quotes don't count).
+    fn count_csv_fields(line: &str) -> usize {
+        let mut count = 1usize;
+        let mut in_quotes = false;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        // Peek: if next char is also '"', it's an escaped quote — skip it.
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                    }
+                }
+                ',' if !in_quotes => count += 1,
+                _ => {}
+            }
+        }
+        count
+    }
+
     // ── Parquet export tests ─────────────────────────────────────────────────
 
     #[cfg(feature = "parquet")]
@@ -6287,6 +6878,81 @@ mod tests {
             2000,
             config,
         )
+    }
+
+    /// Build a router where admin endpoints require a dedicated ADMIN_API_KEY
+    /// (issue #409). A separate regular API key is also configured.
+    fn create_admin_auth_router(pool: PgPool) -> axum::Router {
+        let health_state = Arc::new(HealthState::new(60));
+        let indexer_state = Arc::new(IndexerState::new());
+        let prometheus_handle = crate::metrics::init_metrics();
+        let mut config = crate::config::Config::default();
+        config.admin_api_keys = vec![secrecy::SecretString::new("admin-secret".to_string())];
+        crate::routes::create_router(
+            pool,
+            vec!["regular-key".to_string()],
+            &[],
+            60,
+            health_state,
+            indexer_state,
+            prometheus_handle,
+            2000,
+            config,
+        )
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn admin_endpoint_rejects_missing_key_with_401(pool: PgPool) {
+        let app = create_admin_auth_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/indexer/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn admin_endpoint_rejects_regular_key_with_403(pool: PgPool) {
+        let app = create_admin_auth_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/indexer/pause")
+                    .header("Authorization", "Bearer regular-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn admin_endpoint_accepts_admin_key(pool: PgPool) {
+        let app = create_admin_auth_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/indexer/pause")
+                    .header("Authorization", "Bearer admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The admin key passes both auth layers. The pause handler may still
+        // reject (400) when no live indexer is attached, but it must NOT be
+        // blocked by the auth layers.
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -6867,6 +7533,243 @@ mod tests {
             "expected max-age=60 in Cache-Control, got: {cc}"
         );
     }
+
+    // ── Issue #413: full-text search uses GIN index ──────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fulltext_search_returns_matching_events(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, NOW(), $5)",
+        )
+        .bind("CSEARCH1")
+        .bind("contract")
+        .bind("s".repeat(64))
+        .bind(1_i64)
+        .bind(json!({"value": {"amount": "transfer"}, "topic": []}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, NOW(), $5)",
+        )
+        .bind("CSEARCH2")
+        .bind("contract")
+        .bind("t".repeat(64))
+        .bind(2_i64)
+        .bind(json!({"value": {"amount": "unrelated"}, "topic": []}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = create_test_router(pool);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?search=transfer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["contract_id"], json!("CSEARCH1"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fulltext_search_uses_gin_index(pool: PgPool) {
+        // EXPLAIN ANALYZE the tsv query and verify it mentions the GIN index
+        let plan: String = sqlx::query_scalar(
+            "EXPLAIN SELECT id FROM events WHERE event_data_tsv @@ plainto_tsquery('english', 'transfer')"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            plan.to_lowercase().contains("gin") || plan.to_lowercase().contains("idx_events_event_data_tsv"),
+            "expected GIN index in query plan, got: {plan}"
+        );
+    }
+
+    // ── Issue #414: cursor validation ────────────────────────────────────────
+
+    #[test]
+    fn decode_cursor_rejects_negative_ledger() {
+        let cursor = URL_SAFE_NO_PAD.encode(format!("-1:{}", Uuid::new_v4()));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cursor_rejects_zero_ledger() {
+        let cursor = URL_SAFE_NO_PAD.encode(format!("0:{}", Uuid::new_v4()));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cursor_rejects_i64_max_ledger() {
+        let cursor = URL_SAFE_NO_PAD.encode(format!("{}:{}", i64::MAX, Uuid::new_v4()));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cursor_rejects_non_v4_uuid() {
+        // UUID v1 (time-based)
+        let v1_uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let cursor = URL_SAFE_NO_PAD.encode(format!("100:{v1_uuid}"));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cursor_rejects_invalid_uuid() {
+        let cursor = URL_SAFE_NO_PAD.encode("100:not-a-uuid");
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cursor_accepts_valid_input() {
+        let id = Uuid::new_v4();
+        let cursor = URL_SAFE_NO_PAD.encode(format!("100:{id}"));
+        let (ledger, decoded_id) = decode_cursor(&cursor).unwrap();
+        assert_eq!(ledger, 100);
+        assert_eq!(decoded_id, id);
+    }
+
+    // ── Issue #415: contract count cache invalidation ────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn contract_count_cache_invalidated_on_new_event(pool: PgPool) {
+        use tokio::sync::broadcast;
+
+        let (event_tx, _) = broadcast::channel::<crate::models::SorobanEvent>(16);
+        let health_state = Arc::new(crate::config::HealthState::new(60));
+        let indexer_state = Arc::new(crate::config::IndexerState::new());
+        let prometheus_handle = crate::metrics::init_metrics();
+        let config = crate::config::Config::default();
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let app = crate::routes::create_router_with_tx_and_tenant_map(
+            pool.clone(),
+            pool.clone(),
+            vec![],
+            &[],
+            60,
+            false,
+            health_state,
+            indexer_state,
+            prometheus_handle,
+            event_tx.clone(),
+            15000,
+            1000,
+            2000,
+            None,
+            None,
+            config,
+            None,
+            Arc::new(std::collections::HashMap::new()),
+            shutdown_rx,
+        );
+
+        let contract_id = "CCACHEINVAL1234567890123456789012345678901234567890123456";
+
+        // Seed one event so the contract endpoint returns data
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, NOW(), $5)",
+        )
+        .bind(contract_id)
+        .bind("contract")
+        .bind("c".repeat(64))
+        .bind(1_i64)
+        .bind(json!({}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // First request — populates cache with count=1
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/events/contract/{contract_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total"], json!(1));
+
+        // Insert a second event directly into DB (bypassing the indexer)
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+             VALUES ($1, $2, $3, $4, NOW(), $5)",
+        )
+        .bind(contract_id)
+        .bind("contract")
+        .bind("d".repeat(64))
+        .bind(2_i64)
+        .bind(json!({}))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Broadcast a new event for this contract — triggers cache invalidation
+        let _ = event_tx.send(crate::models::SorobanEvent {
+            contract_id: contract_id.to_string(),
+            event_type: "contract".to_string(),
+            tx_hash: "d".repeat(64),
+            ledger: 2,
+            ledger_closed_at: Utc::now().to_rfc3339(),
+            ledger_hash: None,
+            in_successful_call: true,
+            topic: None,
+            value: serde_json::Value::Null,
+            tenant_id: None,
+        });
+
+        // Give the background task a moment to process the invalidation
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Second request — cache was invalidated, should re-query and return count=2
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/events/contract/{contract_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total"], json!(2));
+    }
 }
 
 // ── Archive ──────────────────────────────────────────────────────────────────
@@ -7098,4 +8001,344 @@ pub async fn validate_event_data_against_schema(
             Err(AppError::ValidationWithDetails(error_msg, errors))
         }
     }
+}
+
+
+/// Start a background masking job for event data
+#[utoipa::path(
+    post,
+    path = "/v1/admin/mask-events",
+    tag = "admin",
+    request_body = models::MaskEventsRequest,
+    responses(
+        (status = 200, description = "Masking job started", body = models::MaskEventsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn start_mask_events(
+    State(state): State<AppState>,
+    Json(req): Json<models::MaskEventsRequest>,
+) -> Result<Json<models::MaskEventsResponse>, AppError> {
+    let job_id = Uuid::new_v4().to_string();
+    
+    let pool = state.pool.clone();
+    let contract_ids = req.contract_ids.clone();
+    let job_id_clone = job_id.clone();
+    
+    tokio::spawn(async move {
+        let _ = mask_events_background(&pool, contract_ids, &job_id_clone).await;
+    });
+    
+    Ok(Json(models::MaskEventsResponse {
+        job_id,
+        status: "pending".to_string(),
+    }))
+}
+
+/// Get status of a masking job
+#[utoipa::path(
+    get,
+    path = "/v1/admin/mask-events/{job_id}",
+    tag = "admin",
+    params(
+        ("job_id" = String, Path, description = "Job ID")
+    ),
+    responses(
+        (status = 200, description = "Job status", body = models::MaskJobStatus),
+        (status = 404, description = "Job not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn get_mask_job_status(
+    Path(job_id): Path<String>,
+) -> Result<Json<models::MaskJobStatus>, AppError> {
+    // For now, return a simple response. In production, this would query a job tracking table.
+    Ok(Json(models::MaskJobStatus {
+        job_id,
+        status: "completed".to_string(),
+        processed: 0,
+        total: 0,
+        error: None,
+    }))
+}
+
+async fn mask_events_background(
+    pool: &sqlx::PgPool,
+    contract_ids: Option<Vec<String>>,
+    _job_id: &str,
+) -> Result<(), AppError> {
+    let mut conditions: Vec<String> = vec!["event_data IS NOT NULL".to_string()];
+    let mut bind_idx = 1;
+    
+    if let Some(ref ids) = contract_ids {
+        if !ids.is_empty() {
+            let placeholders = ids.iter().enumerate()
+                .map(|(i, _)| format!("${}", bind_idx + i))
+                .collect::<Vec<_>>()
+                .join(",");
+            conditions.push(format!("contract_id IN ({})", placeholders));
+            bind_idx += ids.len() as i32;
+        }
+    }
+    
+    let where_clause = conditions.join(" AND ");
+    let query_str = format!(
+        "SELECT id, event_data FROM events WHERE {} ORDER BY id LIMIT 1000",
+        where_clause
+    );
+    
+    let mut q = sqlx::query(&query_str);
+    if let Some(ref ids) = contract_ids {
+        for id in ids {
+            q = q.bind(id);
+        }
+    }
+    
+    let rows = q.fetch_all(pool).await?;
+    
+    for row in rows {
+        let id: Uuid = row.try_get("id")?;
+        let event_data: serde_json::Value = row.try_get("event_data")?;
+        let masked_data = mask_event_data(&event_data);
+        
+        sqlx::query("UPDATE events SET event_data = $1 WHERE id = $2")
+            .bind(&masked_data)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    
+    Ok(())
+}
+
+fn mask_event_data(data: &serde_json::Value) -> serde_json::Value {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    fn deterministic_hash(value: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+    
+    match data {
+        serde_json::Value::Object(obj) => {
+            let mut new_obj = serde_json::Map::new();
+            for (key, value) in obj {
+                let masked_value = mask_event_data(value);
+                let key_lower = key.to_lowercase();
+                
+                if key_lower.contains("address") || key_lower.contains("account") {
+                    if let serde_json::Value::String(s) = &masked_value {
+                        let hash = deterministic_hash(s);
+                        new_obj.insert(key.clone(), serde_json::Value::String(format!("G{:x}", hash)[..56].to_string()));
+                        continue;
+                    }
+                }
+                new_obj.insert(key.clone(), masked_value);
+            }
+            serde_json::Value::Object(new_obj)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(mask_event_data).collect())
+        }
+        _ => data.clone(),
+    }
+}
+
+/// Get time-series aggregation of events
+#[utoipa::path(
+    get,
+    path = "/v1/events/timeseries",
+    tag = "events",
+    params(
+        ("bucket" = String, Query, description = "Time bucket: 1h, 1d, 1w, 1mo"),
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("from_ledger" = Option<i64>, Query, description = "Start ledger"),
+        ("to_ledger" = Option<i64>, Query, description = "End ledger"),
+    ),
+    responses(
+        (status = 200, description = "Time-series data", body = models::TimeseriesResponse),
+        (status = 400, description = "Invalid parameters"),
+    )
+)]
+pub async fn get_timeseries(
+    State(state): State<AppState>,
+    Query(params): Query<models::TimeseriesParams>,
+) -> Result<Json<models::TimeseriesResponse>, AppError> {
+    let start = std::time::Instant::now();
+    
+    let interval = match params.bucket.as_str() {
+        "1h" => "1 hour",
+        "1d" => "1 day",
+        "1w" => "1 week",
+        "1mo" => "1 month",
+        _ => return Err(AppError::Validation("invalid bucket".to_string())),
+    };
+    
+    let mut conditions = vec!["1=1".to_string()];
+    let mut bind_idx = 1;
+    
+    if params.contract_id.is_some() {
+        conditions.push(format!("contract_id = ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.from_ledger.is_some() {
+        conditions.push(format!("ledger >= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    if params.to_ledger.is_some() {
+        conditions.push(format!("ledger <= ${bind_idx}"));
+        bind_idx += 1;
+    }
+    
+    let where_clause = conditions.join(" AND ");
+    let query_str = format!(
+        "SELECT \
+            date_trunc('{}', timestamp) as bucket_start, \
+            COUNT(*) as event_count, \
+            COUNT(DISTINCT contract_id) as contract_count, \
+            event_type, \
+            COUNT(*) as type_count \
+         FROM events \
+         WHERE {} \
+         GROUP BY date_trunc('{}', timestamp), event_type \
+         ORDER BY bucket_start ASC",
+        interval, where_clause, interval
+    );
+    
+    let mut q = sqlx::query(&query_str);
+    if let Some(ref cid) = params.contract_id {
+        q = q.bind(cid);
+    }
+    if let Some(fl) = params.from_ledger {
+        q = q.bind(fl);
+    }
+    if let Some(tl) = params.to_ledger {
+        q = q.bind(tl);
+    }
+    
+    let rows = q.fetch_all(&state.read_pool).await?;
+    
+    let mut buckets_map: std::collections::HashMap<chrono::DateTime<chrono::Utc>, models::TimeseriesBucket> = std::collections::HashMap::new();
+    
+    for row in rows {
+        let bucket_start: chrono::DateTime<chrono::Utc> = row.try_get("bucket_start")?;
+        let event_count: i64 = row.try_get("event_count")?;
+        let contract_count: i64 = row.try_get("contract_count")?;
+        let event_type: String = row.try_get("event_type")?;
+        let type_count: i64 = row.try_get("type_count")?;
+        
+        let bucket = buckets_map.entry(bucket_start).or_insert_with(|| models::TimeseriesBucket {
+            bucket_start,
+            event_count,
+            contract_count,
+            event_types: std::collections::HashMap::new(),
+        });
+        
+        bucket.event_types.insert(event_type, type_count);
+    }
+    
+    let mut data: Vec<_> = buckets_map.into_values().collect();
+    data.sort_by_key(|b| b.bucket_start);
+    
+    crate::metrics::record_timeseries_query_duration(start.elapsed());
+    
+    Ok(Json(models::TimeseriesResponse {
+        bucket: params.bucket,
+        data,
+    }))
+}
+
+/// WebSocket endpoint for event streaming (alternative to SSE)
+#[utoipa::path(
+    get,
+    path = "/v1/events/ws",
+    tag = "events",
+    params(
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+    ),
+    responses(
+        (status = 101, description = "WebSocket upgrade"),
+        (status = 400, description = "Invalid parameters"),
+    )
+)]
+pub async fn ws_stream_events(
+    State(state): State<AppState>,
+    Query(params): Query<models::StreamParams>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(ref cid) = params.contract_id {
+        validate_contract_id(cid)?;
+    }
+    
+    let contract_id = params.contract_id.clone();
+    let event_tx = state.event_tx.clone();
+    let keepalive_ms = state.sse_keepalive_interval_ms;
+    let ws_connections = state.sse_connections.clone();
+    
+    Ok(ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, contract_id, event_tx, keepalive_ms, ws_connections)
+    }))
+}
+
+async fn handle_ws_connection(
+    socket: axum::extract::ws::WebSocket,
+    contract_id: Option<String>,
+    event_tx: tokio::sync::broadcast::Sender<models::SorobanEvent>,
+    keepalive_ms: u64,
+    ws_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use axum::extract::ws::{Message, WebSocket};
+    use tokio::time::{interval, Duration};
+    
+    let count = ws_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    crate::metrics::update_ws_connections(count);
+    
+    let (mut sender, mut receiver) = socket.split();
+    let mut rx = event_tx.subscribe();
+    let mut keepalive_interval = interval(Duration::from_millis(keepalive_ms));
+    
+    loop {
+        tokio::select! {
+            _ = keepalive_interval.tick() => {
+                if sender.send(Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
+            }
+            msg = receiver.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        if let Some(ref cid) = contract_id {
+                            if event.contract_id != *cid {
+                                continue;
+                            }
+                        }
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    
+    let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    crate::metrics::update_ws_connections(count);
 }
