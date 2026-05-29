@@ -7431,10 +7431,10 @@ async fn handle_ws_connection(
     ws_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use axum::extract::ws::{Message, WebSocket};
-    use futures::stream::StreamExt;
     use tokio::time::{interval, Duration};
     
-    ws_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let count = ws_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    crate::metrics::update_ws_connections(count);
     
     let (mut sender, mut receiver) = socket.split();
     let mut rx = event_tx.subscribe();
@@ -7473,5 +7473,6 @@ async fn handle_ws_connection(
         }
     }
     
-    ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    crate::metrics::update_ws_connections(count);
 }
