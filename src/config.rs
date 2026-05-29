@@ -184,6 +184,8 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_secret: Option<String>,
     pub webhook_contract_filter: Vec<String>,
+    /// Require HTTPS for webhook URLs (default: false for development, true for production)
+    pub webhook_require_https: bool,
     /// Event types to index (empty = all types)
     pub indexer_event_types: Vec<String>,
     /// AES-GCM encryption key for event_data (32 bytes, hex-encoded)
@@ -327,6 +329,7 @@ impl Default for Config {
             pruning_interval_hours: 24,
             sse_replay_limit: 500,
             indexer_ignore_checkpoint: false,
+            webhook_require_https: false,
         }
     }
 }
@@ -969,6 +972,9 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            webhook_require_https: env_or_file("WEBHOOK_REQUIRE_HTTPS", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or_else(|| environment.is_production_like()),
             indexer_event_types,
             event_data_encryption_key,
             event_data_encryption_key_old,
