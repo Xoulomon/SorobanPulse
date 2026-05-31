@@ -271,6 +271,20 @@ pub fn record_sse_multi_contract_ids(count: u64) {
     m::histogram!("soroban_pulse_sse_multi_contract_ids").record(count as f64);
 }
 
+/// Record SSE per-IP connection count (histogram, issue #453)
+pub fn record_sse_connections_per_ip(count: usize) {
+    m::histogram!("soroban_pulse_sse_connections_per_ip").record(count as f64);
+}
+
+/// Increment the lagged events counter (issue #451)
+pub fn increment_sse_lagged_events(connection_id: &str, count: u64) {
+    m::counter!(
+        "soroban_pulse_sse_lagged_events_total",
+        "connection_id" => connection_id.to_string()
+    )
+    .increment(count);
+}
+
 /// Record a slow query (issue #421).
 pub fn record_slow_query(query_type: &str) {
     m::counter!("soroban_pulse_slow_queries_total", "query_type" => query_type.to_string())

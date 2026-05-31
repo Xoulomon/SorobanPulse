@@ -1,6 +1,7 @@
 use axum::extract::MatchedPath;
 use axum::http::{HeaderValue, Method, Request};
 use axum::{body::Body, routing::get, Router};
+use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::sync::atomic::AtomicUsize;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub stats_cache: moka::future::Cache<String, serde_json::Value>,
     /// Shutdown signal for SSE streams (Issue #405)
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Per-IP SSE connection counts (Issue #453)
+    pub sse_connections_per_ip: Arc<DashMap<String, usize>>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -308,6 +311,7 @@ pub fn create_router_with_tx_and_tenant_map(
         tenant_map,
         stats_cache,
         shutdown_rx,
+        sse_connections_per_ip: Arc::new(DashMap::new()),
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and

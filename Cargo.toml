@@ -49,6 +49,9 @@ bloomfilter = "3"
 # Issue #268: Contract count cache
 moka = { version = "0.12", features = ["future"] }
 
+# Issue #453: Per-IP SSE connection tracking
+dashmap = "5"
+
 # Issue #367: Zeroizing secrets
 secrecy = { version = "0.8", features = ["serde"] }
 

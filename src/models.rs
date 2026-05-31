@@ -184,6 +184,8 @@ impl SearchParams {
 pub struct StreamParams {
     pub contract_id: Option<String>,
     pub fields: Option<String>,
+    /// Filter by event type: contract, diagnostic, system
+    pub event_type: Option<EventType>,
 }
 
 /// Query parameters for the multi-contract SSE stream endpoint.
@@ -191,6 +193,8 @@ pub struct StreamParams {
 pub struct MultiStreamParams {
     /// Comma-separated list of contract IDs to subscribe to.
     pub contract_ids: Option<String>,
+    /// Filter by event type: contract, diagnostic, system
+    pub event_type: Option<EventType>,
 }
 
 /// Standard error response body returned by all error responses.

@@ -808,7 +808,8 @@ pub async fn stream_events(
     extensions: axum::http::Extensions,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
-    stream_events_internal(State(state), params.contract_id, params.fields, headers, tenant_id)
+    let client_ip = extract_client_ip(&headers);
+    stream_events_internal(State(state), params.contract_id, params.fields, params.event_type, headers, tenant_id, client_ip)
         .await
 }
 
@@ -841,7 +842,8 @@ pub async fn stream_events_by_contract(
         (status, body)
     })?;
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
-    stream_events_internal(State(state), Some(contract_id), params.fields, headers, tenant_id)
+    let client_ip = extract_client_ip(&headers);
+    stream_events_internal(State(state), Some(contract_id), params.fields, params.event_type, headers, tenant_id, client_ip)
         .await
 }
 
@@ -869,6 +871,8 @@ pub async fn stream_events_multi(
     extensions: axum::http::Extensions,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     let tenant_id = extract_tenant_id(&extensions).map(|s| s.to_owned());
+    let client_ip = extract_client_ip(&headers);
+    let event_type_filter = params.event_type;
     let raw = params.contract_ids.unwrap_or_default();
     if raw.trim().is_empty() {
         return Err((
@@ -913,7 +917,7 @@ pub async fn stream_events_multi(
         ));
     }
 
-    // Check connection limit
+    // Check global connection limit
     let current_connections = state
         .sse_connections
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -922,6 +926,29 @@ pub async fn stream_events_multi(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "too many SSE connections", "code": "SSE_LIMIT_EXCEEDED" })),
         ));
+    }
+
+    // #453: Per-IP connection limit check
+    let max_per_ip = state.config.sse_max_connections_per_ip;
+    if max_per_ip > 0 {
+        let current_ip_count = state
+            .sse_connections_per_ip
+            .get(&client_ip)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if current_ip_count >= max_per_ip {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many SSE connections from this IP",
+                    "code": "SSE_IP_LIMIT_EXCEEDED",
+                    "limit": max_per_ip,
+                })),
+            ));
+        }
+        *state.sse_connections_per_ip.entry(client_ip.clone()).or_insert(0) += 1;
+        let new_ip_count = state.sse_connections_per_ip.get(&client_ip).map(|v| *v).unwrap_or(0);
+        crate::metrics::record_sse_connections_per_ip(new_ip_count);
     }
 
     state
@@ -934,8 +961,13 @@ pub async fn stream_events_multi(
 
     let keepalive_ms = state.sse_keepalive_interval_ms;
     let sse_connections = state.sse_connections.clone();
+    let sse_connections_per_ip = state.sse_connections_per_ip.clone();
+    let client_ip_cleanup = client_ip.clone();
+    let max_per_ip_cleanup = max_per_ip;
+    let max_lag = state.config.sse_max_lag_before_disconnect;
+    let connection_id = Uuid::new_v4().to_string();
 
-    // Replay missed events for any of the subscribed contracts.
+    // #454: Replay missed events for any of the subscribed contracts.
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -958,8 +990,8 @@ pub async fn stream_events_multi(
         let sql = format!(
             "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, 0::bigint AS total_count \
              FROM events WHERE created_at > (SELECT created_at FROM events WHERE id = $1) \
-             AND contract_id IN ({}){} ORDER BY created_at ASC",
-            placeholders, tenant_clause
+             AND contract_id IN ({}){} ORDER BY created_at ASC LIMIT {}",
+            placeholders, tenant_clause, state.config.sse_replay_limit
         );
         let mut q = sqlx::query_as::<_, crate::models::Event>(&sql).bind(last_id);
         for id in &ids {
@@ -973,34 +1005,57 @@ pub async fn stream_events_multi(
         vec![]
     };
 
+    let has_replay = !replay.is_empty();
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
 
-    let replay_stream = futures::stream::iter(replay.into_iter().map(move |mut ev| {
+    // #452: Apply event_type filter during replay
+    let et_filter_replay = event_type_filter;
+    let replay_stream = futures::stream::iter(replay.into_iter().filter_map(move |mut ev| {
+        if let Some(et) = et_filter_replay {
+            if ev.event_type != et {
+                return None;
+            }
+        }
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = serde_json::to_string(&ev).unwrap_or_default();
-        Ok(Event::default()
+        Some(Ok(Event::default()
             .id(ev.id.to_string())
             .retry(Duration::from_millis(keepalive_ms))
-            .data(data))
+            .data(data)))
     }));
 
+    // #454: replay_complete event
+    let replay_complete_stream = if has_replay {
+        futures::stream::iter(vec![Ok(Event::default()
+            .event("replay_complete")
+            .data("replay complete"))])
+    } else {
+        futures::stream::iter(vec![])
+    };
+
     let live_stream = futures::stream::unfold(
-        (rx, ids, keepalive_ms, tenant_id, false),
-        move |(mut rx, filter_ids, ka, tid, closed)| async move {
+        (rx, ids, keepalive_ms, tenant_id, event_type_filter, false, max_lag, connection_id.clone()),
+        move |(mut rx, filter_ids, ka, tid, et_filter, closed, max_lag, conn_id)| async move {
             if closed {
                 return None;
             }
             let mut interval = tokio::time::interval(Duration::from_millis(ka));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await; // consume the immediate first tick
+            interval.tick().await;
             loop {
                 tokio::select! {
                     recv = rx.recv() => match recv {
                         Ok(event) => {
                             if !filter_ids.contains(&event.contract_id) {
                                 continue;
+                            }
+                            // #452: Filter by event_type
+                            if let Some(et) = et_filter {
+                                if event.event_type.to_string() != et.to_string() {
+                                    continue;
+                                }
                             }
                             if let Some(ref tenant) = tid {
                                 if event.tenant_id.as_deref() != Some(tenant.as_str()) {
@@ -1012,34 +1067,47 @@ pub async fn stream_events_multi(
                                 .id(format!("{}-{}", event.tx_hash, event.ledger))
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
-                            return Some((Ok(sse), (rx, filter_ids, ka, tid, false)));
+                            return Some((Ok(sse), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // #451: Send lag notification
+                            crate::metrics::increment_sse_lagged_events(&conn_id, n);
+                            let lag_data = serde_json::json!({ "missed": n, "last_event_id": null });
+                            let lag_event = Event::default().event("lag").data(lag_data.to_string());
+                            if max_lag > 0 && n >= max_lag {
+                                return Some((Ok(lag_event), (rx, filter_ids, ka, tid, et_filter, true, max_lag, conn_id)));
+                            }
+                            return Some((Ok(lag_event), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let close_event = Event::default().event("close").data("stream closed");
-                            return Some((Ok(close_event), (rx, filter_ids, ka, tid, true)));
+                            return Some((Ok(close_event), (rx, filter_ids, ka, tid, et_filter, true, max_lag, conn_id)));
                         }
                     },
                     _ = interval.tick() => {
                         let ts = chrono::Utc::now().to_rfc3339();
                         let ping = Event::default().event("ping").data(ts);
-                        return Some((Ok(ping), (rx, filter_ids, ka, tid, false)));
+                        return Some((Ok(ping), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
                     }
                 }
             }
         },
     );
 
-    let combined = replay_stream.chain(live_stream);
+    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
 
     let stream_with_cleanup = futures::stream::unfold(
-        (Box::pin(combined), sse_connections.clone()),
-        move |(mut stream, counter)| async move {
+        (Box::pin(combined), sse_connections.clone(), sse_connections_per_ip, client_ip_cleanup, max_per_ip_cleanup),
+        move |(mut stream, counter, ip_map, ip, max_ip)| async move {
             match stream.next().await {
-                Some(item) => Some((item, (stream, counter))),
+                Some(item) => Some((item, (stream, counter, ip_map, ip, max_ip))),
                 None => {
                     let new_count = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     crate::metrics::update_sse_connections(new_count);
+                    if max_ip > 0 {
+                        let mut entry = ip_map.entry(ip.clone()).or_insert(0);
+                        if *entry > 0 { *entry -= 1; }
+                    }
                     None
                 }
             }
@@ -1128,8 +1196,10 @@ async fn stream_events_internal(
     State(state): State<AppState>,
     contract_filter: Option<String>,
     fields: Option<String>,
+    event_type_filter: Option<crate::models::EventType>,
     headers: axum::http::HeaderMap,
     tenant_id: Option<String>,
+    client_ip: String,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     // Check if we've reached the max SSE connections limit
     let current_connections = state
@@ -1145,6 +1215,30 @@ async fn stream_events_internal(
         ));
     }
 
+    // #453: Per-IP connection limit check
+    let max_per_ip = state.config.sse_max_connections_per_ip;
+    if max_per_ip > 0 {
+        let current_ip_count = state
+            .sse_connections_per_ip
+            .get(&client_ip)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if current_ip_count >= max_per_ip {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many SSE connections from this IP",
+                    "code": "SSE_IP_LIMIT_EXCEEDED",
+                    "limit": max_per_ip,
+                })),
+            ));
+        }
+        // Increment per-IP counter
+        *state.sse_connections_per_ip.entry(client_ip.clone()).or_insert(0) += 1;
+        let new_ip_count = state.sse_connections_per_ip.get(&client_ip).map(|v| *v).unwrap_or(0);
+        crate::metrics::record_sse_connections_per_ip(new_ip_count);
+    }
+
     // Increment connection counter
     state
         .sse_connections
@@ -1156,20 +1250,29 @@ async fn stream_events_internal(
 
     let keepalive_ms = state.sse_keepalive_interval_ms;
     let sse_connections = state.sse_connections.clone();
+    let sse_connections_per_ip = state.sse_connections_per_ip.clone();
+    let client_ip_cleanup = client_ip.clone();
+    let max_per_ip_cleanup = max_per_ip;
 
     // Validate contract_id if provided
     if let Some(ref cid) = contract_filter {
         validate_contract_id(cid).map_err(|e| {
+            // Decrement per-IP counter on validation error
+            if max_per_ip > 0 {
+                let mut entry = sse_connections_per_ip.entry(client_ip.clone()).or_insert(0);
+                if *entry > 0 { *entry -= 1; }
+            }
+            state.sse_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let body = json!({ "error": e.to_string(), "code": "VALIDATION_ERROR" });
             (StatusCode::BAD_REQUEST, Json(body))
         })?;
     }
 
-    // Resolve field projection — silently ignore unknown fields (consistent with REST endpoints).
+    // Resolve field projection
     let field_columns: Option<Vec<&'static str>> = fields.as_deref().and_then(|f| {
         let trimmed = f.trim();
         if trimmed.is_empty() {
-            return None; // empty → all fields
+            return None;
         }
         let cols: Vec<&'static str> = trimmed
             .split(',')
@@ -1181,14 +1284,10 @@ async fn stream_events_internal(
                     .copied()
             })
             .collect();
-        if cols.is_empty() {
-            None
-        } else {
-            Some(cols)
-        }
+        if cols.is_empty() { None } else { Some(cols) }
     });
 
-    // Replay missed events if the client sends Last-Event-ID (a UUID).
+    // #454: Replay missed events if the client sends Last-Event-ID
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -1203,7 +1302,7 @@ async fn stream_events_internal(
             )
             .bind(last_id)
             .bind(cid)
-            .bind(state.sse_replay_limit as i64)
+            .bind(state.config.sse_replay_limit as i64)
             .fetch_all(&state.pool)
             .await
         } else {
@@ -1213,7 +1312,7 @@ async fn stream_events_internal(
                  ORDER BY created_at ASC LIMIT $2",
             )
             .bind(last_id)
-            .bind(state.sse_replay_limit as i64)
+            .bind(state.config.sse_replay_limit as i64)
             .fetch_all(&state.pool)
             .await
         };
@@ -1222,12 +1321,24 @@ async fn stream_events_internal(
         vec![]
     };
 
+    let has_replay = !replay.is_empty();
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
+    let max_lag = state.config.sse_max_lag_before_disconnect;
+    // Generate a stable connection ID for lag metrics
+    let connection_id = Uuid::new_v4().to_string();
 
     let field_columns_replay = field_columns.clone();
-    let replay_stream = stream::iter(replay.into_iter().map(move |mut ev| {
+    // #452: Apply event_type filter during replay
+    let et_filter_replay = event_type_filter;
+    let replay_stream = stream::iter(replay.into_iter().filter_map(move |mut ev| {
+        // #452: Filter by event_type during replay
+        if let Some(et) = et_filter_replay {
+            if ev.event_type != et {
+                return None;
+            }
+        }
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = match &field_columns_replay {
             Some(cols) => serde_json::to_string(&filter_fields(
@@ -1239,11 +1350,20 @@ async fn stream_events_internal(
             .unwrap_or_default(),
             None => serde_json::to_string(&ev).unwrap_or_default(),
         };
-        Ok(Event::default()
+        Some(Ok(Event::default()
             .id(ev.id.to_string())
             .retry(Duration::from_millis(keepalive_ms))
-            .data(data))
+            .data(data)))
     }));
+
+    // #454: replay_complete event after replay
+    let replay_complete_stream = if has_replay {
+        stream::iter(vec![Ok(Event::default()
+            .event("replay_complete")
+            .data("replay complete"))])
+    } else {
+        stream::iter(vec![])
+    };
 
     let live_stream = stream::unfold(
         (
@@ -1254,16 +1374,19 @@ async fn stream_events_internal(
             enc_key,
             enc_key_old,
             tenant_id,
+            event_type_filter,
             false, // closed
             state.shutdown_rx.clone(),
+            max_lag,
+            connection_id.clone(),
         ),
-        move |(mut rx, filter, ka, cols, ek, ek_old, tid, closed, mut shutdown_rx)| async move {
+        move |(mut rx, filter, ka, cols, ek, ek_old, tid, et_filter, closed, mut shutdown_rx, max_lag, conn_id)| async move {
             if closed {
                 return None;
             }
             let mut interval = tokio::time::interval(Duration::from_millis(ka));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await; // consume the immediate first tick
+            interval.tick().await;
             loop {
                 tokio::select! {
                     recv = rx.recv() => match recv {
@@ -1273,7 +1396,12 @@ async fn stream_events_internal(
                                     continue;
                                 }
                             }
-                            // Tenant isolation: drop events belonging to other tenants.
+                            // #452: Filter by event_type
+                            if let Some(et) = et_filter {
+                                if event.event_type.to_string() != et.to_string() {
+                                    continue;
+                                }
+                            }
                             if let Some(ref tenant) = tid {
                                 if event.tenant_id.as_deref() != Some(tenant.as_str()) {
                                     continue;
@@ -1284,41 +1412,61 @@ async fn stream_events_internal(
                                 .id(event.id.to_string())
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
-                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
+                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // #451: Send lag notification event
+                            crate::metrics::increment_sse_lagged_events(&conn_id, n);
+                            let last_id = rx.len(); // approximate position
+                            let lag_data = serde_json::json!({
+                                "missed": n,
+                                "last_event_id": null,
+                            });
+                            let lag_event = Event::default()
+                                .event("lag")
+                                .data(lag_data.to_string());
+                            // #451: Disconnect if lag exceeds threshold
+                            if max_lag > 0 && n >= max_lag {
+                                return Some((Ok(lag_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
+                            }
+                            return Some((Ok(lag_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let close_event = Event::default().event("close").data("stream closed");
-                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
+                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
                         }
                     },
                     _ = interval.tick() => {
                         let ts = chrono::Utc::now().to_rfc3339();
                         let ping = Event::default().event("ping").data(ts);
-                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
+                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
                     }
                     _ = shutdown_rx.changed() => {
-                        // Server is shutting down, emit close event
                         let close_event = Event::default().event("close").data("server shutting down");
-                        return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
+                        return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, true, shutdown_rx, max_lag, conn_id)));
                     }
                 }
             }
         },
     );
 
-    let combined = replay_stream.chain(live_stream);
+    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
     let combined = Box::pin(combined);
 
     // Wrap the stream to decrement the connection counter when the stream ends
     let stream_with_cleanup = stream::unfold(
-        (Box::pin(combined), sse_connections.clone()),
-        move |(mut stream, counter)| async move {
+        (Box::pin(combined), sse_connections.clone(), sse_connections_per_ip, client_ip_cleanup, max_per_ip_cleanup),
+        move |(mut stream, counter, ip_map, ip, max_ip)| async move {
             match stream.next().await {
-                Some(item) => Some((item, (stream, counter))),
+                Some(item) => Some((item, (stream, counter, ip_map, ip, max_ip))),
                 None => {
                     let new_count = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     crate::metrics::update_sse_connections(new_count);
+                    // Decrement per-IP counter
+                    if max_ip > 0 {
+                        let mut entry = ip_map.entry(ip.clone()).or_insert(0);
+                        if *entry > 0 { *entry -= 1; }
+                    }
                     None
                 }
             }
@@ -1424,6 +1572,22 @@ fn accepts_ndjson(headers: &axum::http::HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("application/x-ndjson"))
         .unwrap_or(false)
+}
+
+/// Extract client IP from X-Forwarded-For or X-Real-IP headers, falling back to "unknown".
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Build a plain JSON response from a `Value`.

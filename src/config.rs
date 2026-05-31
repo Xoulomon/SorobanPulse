@@ -284,6 +284,11 @@ pub struct Config {
     pub pruning_interval_hours: u64,
     // Issue #325: SSE Last-Event-ID replay limit
     pub sse_replay_limit: u64,
+    // Issue #454: SSE_REPLAY_MAX_EVENTS (alias for sse_replay_limit, read from SSE_REPLAY_MAX_EVENTS env var)
+    // Issue #453: Per-IP SSE connection limit
+    pub sse_max_connections_per_ip: usize,
+    // Issue #451: Max lag before disconnect
+    pub sse_max_lag_before_disconnect: u64,
     // Issue #396: Indexer checkpoint persistence
     pub indexer_ignore_checkpoint: bool,
     // Issue #426: Maximum events per RPC page
@@ -370,7 +375,9 @@ impl Default for Config {
             stats_refresh_interval_secs: 3600,
             retention_days: 90,
             pruning_interval_hours: 24,
-            sse_replay_limit: 500,
+            sse_replay_limit: 1000,
+            sse_max_connections_per_ip: 10,
+            sse_max_lag_before_disconnect: 0, // 0 = disabled
             indexer_ignore_checkpoint: false,
             webhook_require_https: false,
             rpc_max_events_per_page: 200,
@@ -1144,9 +1151,16 @@ impl Config {
             pruning_interval_hours: env_or_file("PRUNING_INTERVAL_HOURS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24),
-            sse_replay_limit: env_or_file("SSE_REPLAY_LIMIT", &file)
+            sse_replay_limit: env_or_file("SSE_REPLAY_MAX_EVENTS", &file)
+                .or_else(|| env_or_file("SSE_REPLAY_LIMIT", &file))
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(500),
+                .unwrap_or(1000),
+            sse_max_connections_per_ip: env_or_file("SSE_MAX_CONNECTIONS_PER_IP", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            sse_max_lag_before_disconnect: env_or_file("SSE_MAX_LAG_BEFORE_DISCONNECT", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             max_ledger_range: parse_int::<u64>(
                 "MAX_LEDGER_RANGE",
                 &env_or_file_or("MAX_LEDGER_RANGE", &file, "100000"),
