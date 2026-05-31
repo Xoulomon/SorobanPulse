@@ -68,6 +68,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream, StreamExt};
 use reqwest;
 use secrecy::ExposeSecret;
+use regex::Regex;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::convert::Infallible;
@@ -121,6 +122,40 @@ where
 
 /// Compute a lightweight ETag from the last event id, created_at, and total count.
 /// Uses SHA-256 truncated to 8 bytes, base64-encoded — no double-serialization needed.
+const MAX_DATA_PATTERN_LEN: usize = 256;
+const MAX_REGEX_PATTERN_LEN: usize = 256;
+
+fn validate_jsonpath_expr(expr: &str) -> Result<(), AppError> {
+    if expr.is_empty() || expr.len() > MAX_DATA_PATTERN_LEN {
+        return Err(AppError::Validation(
+            "data_pattern expression is invalid or too long".to_string(),
+        ));
+    }
+
+    let path_re = Regex::new(r"^\$(?:\.[A-Za-z_][A-Za-z0-9_]*|\['[A-Za-z0-9_]+\'])*$").unwrap();
+    if !path_re.is_match(expr) {
+        return Err(AppError::Validation(
+            "data_pattern must be a simple JSONPath expression like $.amount".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_regex_pattern(pattern: &str) -> Result<(), AppError> {
+    if pattern.is_empty() || pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(AppError::Validation(
+            "pattern is invalid or too complex".to_string(),
+        ));
+    }
+    Regex::new(pattern).map_err(|_| AppError::Validation("pattern is not a valid regular expression".to_string()))?;
+    Ok(())
+}
+
+fn format_jsonpath_filter(path: &str, pattern: &str) -> String {
+    let escaped = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{path} ? (@ like_regex \"{escaped}\")")
+}
+
 fn compute_etag(last_id: &Uuid, last_created_at: &DateTime<Utc>, total: Option<i64>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -330,6 +365,9 @@ fn rows_to_json(
                 }
                 "anonymized" => {
                     event.insert(col.to_string(), json!(row.try_get::<bool, _>(col)?));
+                }
+                "relevance_score" => {
+                    event.insert(col.to_string(), json!(row.try_get::<f64, _>(col)?));
                 }
                 _ => {}
             }
@@ -1875,9 +1913,20 @@ pub async fn get_events(
             conditions.push(format!("event_data->'topic'->3 @> ${bind_idx}::jsonb"));
             bind_idx += 1;
         }
+
+        let mut search_param_idx: Option<i32> = None;
         if params.search.is_some() {
+            search_param_idx = Some(bind_idx);
             conditions.push(format!(
-                "event_data_tsv @@ plainto_tsquery('english', ${bind_idx})"
+                "event_data_tsv @@ plainto_tsquery('english', ${})",
+                bind_idx
+            ));
+            bind_idx += 1;
+        }
+
+        if params.data_pattern.is_some() {
+            conditions.push(format!(
+                "jsonb_path_exists(event_data, ${bind_idx}::jsonpath)"
             ));
             bind_idx += 1;
         }
@@ -1920,6 +1969,27 @@ pub async fn get_events(
             select_cols.push("created_at");
         }
 
+        let mut select_query_cols: Vec<String> = select_cols.iter().map(|v| v.to_string()).collect();
+        if params.rank_by_relevance.unwrap_or(false) {
+            if params.search.is_none() {
+                return Err(AppError::Validation(
+                    "rank_by_relevance requires search query".to_string(),
+                ));
+            }
+            if select_query_cols
+                .iter()
+                .all(|c| c != "relevance_score")
+            {
+                select_cols.push("relevance_score");
+            }
+            if let Some(search_idx) = search_param_idx {
+                select_query_cols.push(format!(
+                    "ts_rank(event_data_tsv, plainto_tsquery('english', ${})) AS relevance_score",
+                    search_idx
+                ));
+            }
+        }
+
         // Defence-in-depth: re-validate each column before SQL interpolation
         for col in &select_cols {
             if !models::PaginationParams::validate_column_name(col) {
@@ -1930,12 +2000,17 @@ pub async fn get_events(
             }
         }
 
+        let order_clause = if params.rank_by_relevance.unwrap_or(false) {
+            "relevance_score DESC, id DESC".to_string()
+        } else {
+            format!("{col} {dir}, id {dir}", col = sort_col, dir = dir)
+        };
+
         let query_str = format!(
-            "SELECT {} FROM events {} ORDER BY {col} {dir}, id {dir} LIMIT ${}",
-            select_cols.join(", "),
+            "SELECT {} FROM events {} ORDER BY {} LIMIT ${}",
+            select_query_cols.join(", "),
             where_clause,
-            col = sort_col,
-            dir = dir,
+            order_clause,
             bind_idx,
         );
 
@@ -2003,6 +2078,10 @@ pub async fn get_events(
         }
         if let Some(ref t3) = params.topic_3 {
             q = q.bind(serde_json::json!(t3).to_string());
+        }
+        if let Some(ref data_pattern) = params.data_pattern {
+            let expr = format_jsonpath_filter(data_pattern, params.pattern.as_ref().unwrap());
+            q = q.bind(expr);
         }
         if let Some(ref search) = params.search {
             q = q.bind(search);
