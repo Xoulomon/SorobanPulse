@@ -187,6 +187,12 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record a notification that was rate-limited and batched for later delivery
+/// (per-channel rate limiting, issue #476).
+pub fn record_notification_rate_limited() {
+    m::counter!("soroban_pulse_notification_rate_limited_total").increment(1);
+}
+
 /// Record a full-text search query duration
 pub fn record_search_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_search_query_duration_seconds").record(duration.as_secs_f64());

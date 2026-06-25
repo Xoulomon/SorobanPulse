@@ -4859,6 +4859,7 @@ dependencies = [
  "flate2",
  "futures",
  "google-cloud-pubsub",
+ "governor",
  "hex",
  "hmac 0.12.1",
  "http-body-util",

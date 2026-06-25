@@ -36,6 +36,7 @@ mod schema_validator;
 mod stats_refresh;
 mod subscriptions;
 mod webhook;
+mod notification_rate_limit;
 mod notification_formatter;
 mod pagerduty;
 mod xdr_validation;
@@ -195,12 +196,26 @@ async fn main() -> anyhow::Result<()> {
         let webhook_url = webhook_url.clone();
         let webhook_secret = config.webhook_secret.clone();
         let webhook_contract_filter = config.webhook_contract_filter.clone();
+        let webhook_retry_policy = config.webhook_retry_policy.clone();
+        let webhook_pool = pool.clone();
+        // Per-channel rate limiter (Issue #476). `None` when no limit configured.
+        let webhook_rate_limiter = notification_rate_limit::ChannelRateLimiter::from_config(
+            &notification_rate_limit::RateLimitConfig::new(
+                config.webhook_rate_limit_per_minute,
+                config.webhook_rate_limit_per_hour,
+            ),
+        );
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build webhook HTTP client");
 
-        info!(url = %webhook_url, "Webhook delivery enabled");
+        info!(
+            url = %webhook_url,
+            rate_limit_per_minute = ?config.webhook_rate_limit_per_minute,
+            rate_limit_per_hour = ?config.webhook_rate_limit_per_hour,
+            "Webhook delivery enabled"
+        );
 
         tokio::spawn(async move {
             let mut rx = webhook_rx;
@@ -216,15 +231,27 @@ async fn main() -> anyhow::Result<()> {
                         let client = http_client.clone();
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
-                        let pool_ref = Some(pool.as_ref());
-                        tokio::spawn(webhook::deliver_with_retry_policy(
-                            client, 
-                            url, 
-                            secret, 
-                            event, 
-                            pool_ref,
-                            &config.webhook_retry_policy
-                        ));
+                        let retry_policy = webhook_retry_policy.clone();
+                        let task_pool = webhook_pool.clone();
+                        let rate_limiter = webhook_rate_limiter.clone();
+                        tokio::spawn(async move {
+                            // Per-channel rate limiting (Issue #476): when the
+                            // channel is over budget, batch the surplus by
+                            // waiting for the rate-limit window to reset rather
+                            // than dropping the notification.
+                            if let Some(rl) = &rate_limiter {
+                                rl.acquire().await;
+                            }
+                            webhook::deliver_with_retry_policy(
+                                client,
+                                url,
+                                secret,
+                                event,
+                                Some(&task_pool),
+                                &retry_policy,
+                            )
+                            .await;
+                        });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(

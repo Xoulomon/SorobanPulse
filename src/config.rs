@@ -193,6 +193,12 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_secret: Option<String>,
     pub webhook_contract_filter: Vec<String>,
+    /// Max webhook notifications per minute for the configured channel (Issue #476).
+    /// `None` disables the per-minute limit.
+    pub webhook_rate_limit_per_minute: Option<u32>,
+    /// Max webhook notifications per hour for the configured channel (Issue #476).
+    /// `None` disables the per-hour limit.
+    pub webhook_rate_limit_per_hour: Option<u32>,
     /// Require HTTPS for webhook URLs (default: false for development, true for production)
     pub webhook_require_https: bool,
     /// Event types to index (empty = all types)
@@ -356,6 +362,8 @@ impl Default for Config {
             webhook_url: None,
             webhook_secret: None,
             webhook_contract_filter: Vec::new(),
+            webhook_rate_limit_per_minute: None,
+            webhook_rate_limit_per_hour: None,
             indexer_event_types: Vec::new(),
             event_data_encryption_key: None,
             event_data_encryption_key_old: None,
@@ -1104,6 +1112,14 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            webhook_rate_limit_per_minute: env::var("WEBHOOK_RATE_LIMIT_PER_MINUTE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0),
+            webhook_rate_limit_per_hour: env::var("WEBHOOK_RATE_LIMIT_PER_HOUR")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0),
             webhook_require_https: env_or_file("WEBHOOK_REQUIRE_HTTPS", &file)
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or_else(|| environment.is_production_like()),
