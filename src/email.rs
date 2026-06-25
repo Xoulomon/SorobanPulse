@@ -1,4 +1,4 @@
-use lettre::message::{header, MultiPart, SinglePart};
+use lettre::message::{header, Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use secrecy::{ExposeSecret, SecretString};
@@ -11,6 +11,94 @@ use tracing::{error, info, warn};
 
 use crate::{metrics, models::SorobanEvent, retry_policy::RetryPolicy};
 
+/// Issue #481: File format for the digest event-list attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentFormat {
+    /// Comma-separated values (default).
+    Csv,
+    /// JSON array of events.
+    Json,
+}
+
+impl AttachmentFormat {
+    /// Parse `EMAIL_ATTACHMENT_FORMAT`, defaulting to CSV for unknown values.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "json" => AttachmentFormat::Json,
+            _ => AttachmentFormat::Csv,
+        }
+    }
+
+    fn filename(self) -> &'static str {
+        match self {
+            AttachmentFormat::Csv => "events.csv",
+            AttachmentFormat::Json => "events.json",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            AttachmentFormat::Csv => "text/csv",
+            AttachmentFormat::Json => "application/json",
+        }
+    }
+}
+
+/// Escape a single field for inclusion in a CSV document (RFC 4180).
+fn csv_escape(field: &str) -> String {
+    if field.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Issue #481: Render the full event list as a CSV document.
+pub fn generate_csv(events: &[SorobanEvent]) -> String {
+    let mut out =
+        String::from("contract_id,event_type,ledger,ledger_closed_at,tx_hash,in_successful_call\n");
+    for event in events {
+        out.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_escape(&event.contract_id),
+            csv_escape(&event.event_type),
+            event.ledger,
+            csv_escape(&event.ledger_closed_at),
+            csv_escape(&event.tx_hash),
+            event.in_successful_call,
+        ));
+    }
+    out
+}
+
+/// Issue #481: Render the full event list as a pretty-printed JSON array.
+pub fn generate_json(events: &[SorobanEvent]) -> String {
+    serde_json::to_string_pretty(events).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Issue #481: A generated file attachment for digest emails.
+#[derive(Debug, Clone)]
+pub struct EmailAttachment {
+    pub filename: String,
+    pub content: String,
+    pub content_type: String,
+}
+
+impl EmailAttachment {
+    /// Build an attachment containing the full event list in `format`.
+    pub fn for_events(events: &[SorobanEvent], format: AttachmentFormat) -> Self {
+        let content = match format {
+            AttachmentFormat::Csv => generate_csv(events),
+            AttachmentFormat::Json => generate_json(events),
+        };
+        EmailAttachment {
+            filename: format.filename().to_string(),
+            content,
+            content_type: format.content_type().to_string(),
+        }
+    }
+}
+
 /// Batched email notification sender.
 /// Collects events for up to 1 minute, then sends a single summary email.
 pub struct EmailNotifier {
@@ -22,6 +110,11 @@ pub struct EmailNotifier {
     to: Vec<String>,
     contract_filter: Vec<String>,
     retry_policy: RetryPolicy,
+    /// Issue #481: when the event count exceeds this, attach a file instead of
+    /// inlining everything in the body.
+    max_events_in_body: usize,
+    /// Issue #481: format used for the event-list attachment.
+    attachment_format: AttachmentFormat,
     pool: sqlx::PgPool,
 }
 
@@ -35,6 +128,8 @@ impl EmailNotifier {
         to: Vec<String>,
         contract_filter: Vec<String>,
         retry_policy: RetryPolicy,
+        max_events_in_body: usize,
+        attachment_format: AttachmentFormat,
         pool: sqlx::PgPool,
     ) -> Self {
         Self {
@@ -46,6 +141,8 @@ impl EmailNotifier {
             to,
             contract_filter,
             retry_policy,
+            max_events_in_body,
+            attachment_format,
             pool,
         }
     }
@@ -179,8 +276,24 @@ impl EmailNotifier {
             body.push('\n');
         }
 
+        // Issue #481: for large digests, attach the full event list as a file
+        // rather than bloating the message body (which clients may truncate or
+        // reject). The body keeps the per-contract summary and gains a note.
+        let attachment = if events.len() > self.max_events_in_body {
+            let attachment = EmailAttachment::for_events(events, self.attachment_format);
+            body.push_str(&format!(
+                "\nThe full list of {} events is attached as {} ({}).\n",
+                events.len(),
+                attachment.filename,
+                attachment.content_type,
+            ));
+            Some(attachment)
+        } else {
+            None
+        };
+
         // Build and send email
-        if let Err(e) = self.send_email(&subject, &body).await {
+        if let Err(e) = self.send_email(&subject, &body, attachment).await {
             error!(error = %e, "Failed to send email notification");
             metrics::record_email_failure();
         } else {
@@ -193,10 +306,14 @@ impl EmailNotifier {
     }
 
     /// Send an email using SMTP.
+    ///
+    /// Issue #481: when `attachment` is present, the message is built as a
+    /// `multipart/mixed` body with the summary plus the attached file.
     async fn send_email(
         &self,
         subject: &str,
         body: &str,
+        attachment: Option<EmailAttachment>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Build message with all recipients
         let mut message_builder = Message::builder().from(self.from.parse()?).subject(subject);
@@ -205,9 +322,21 @@ impl EmailNotifier {
             message_builder = message_builder.to(recipient.parse()?);
         }
 
-        let message = message_builder
-            .header(header::ContentType::TEXT_PLAIN)
-            .body(body.to_string())?;
+        let message = match attachment {
+            Some(att) => {
+                let content_type = header::ContentType::parse(&att.content_type)
+                    .unwrap_or(header::ContentType::TEXT_PLAIN);
+                let file_part = Attachment::new(att.filename).body(att.content, content_type);
+                message_builder.multipart(
+                    MultiPart::mixed()
+                        .singlepart(SinglePart::plain(body.to_string()))
+                        .singlepart(file_part),
+                )?
+            }
+            None => message_builder
+                .header(header::ContentType::TEXT_PLAIN)
+                .body(body.to_string())?,
+        };
 
         // Build SMTP transport
         let mut transport_builder = SmtpTransport::relay(&self.smtp_host)?.port(self.smtp_port);
@@ -247,11 +376,16 @@ mod tests {
             in_successful_call: true,
             value: json!({"test": "data"}),
             topic: None,
+            ..Default::default()
         }
     }
 
     #[test]
     fn test_email_notifier_creation() {
+        // `connect_lazy` builds a pool handle without opening a connection,
+        // so this stays a pure unit test (no live database required).
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/soroban_pulse_test")
+            .expect("lazy pool");
         let notifier = EmailNotifier::new(
             "smtp.example.com".to_string(),
             587,
@@ -260,12 +394,17 @@ mod tests {
             "from@example.com".to_string(),
             vec!["to@example.com".to_string()],
             vec![],
+            RetryPolicy::default(),
+            50,
+            AttachmentFormat::Csv,
+            pool,
         );
 
         assert_eq!(notifier.smtp_host, "smtp.example.com");
         assert_eq!(notifier.smtp_port, 587);
         assert_eq!(notifier.from, "from@example.com");
         assert_eq!(notifier.to.len(), 1);
+        assert_eq!(notifier.max_events_in_body, 50);
     }
 
     #[test]
@@ -296,5 +435,80 @@ mod tests {
 
         // Empty filter means all events pass
         assert!(filter.is_empty() || filter.contains(&event.contract_id));
+    }
+
+    // --- Issue #481: email attachment generation ---
+
+    #[test]
+    fn test_attachment_format_parse() {
+        assert_eq!(AttachmentFormat::parse("csv"), AttachmentFormat::Csv);
+        assert_eq!(AttachmentFormat::parse("JSON"), AttachmentFormat::Json);
+        // Unknown values default to CSV.
+        assert_eq!(AttachmentFormat::parse("xml"), AttachmentFormat::Csv);
+        assert_eq!(AttachmentFormat::parse(""), AttachmentFormat::Csv);
+    }
+
+    #[test]
+    fn test_generate_csv_has_header_and_rows() {
+        let events = vec![mock_event("CONTRACT_A", 100), mock_event("CONTRACT_B", 101)];
+        let csv = generate_csv(&events);
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert_eq!(
+            lines[0],
+            "contract_id,event_type,ledger,ledger_closed_at,tx_hash,in_successful_call"
+        );
+        // One header line + one line per event.
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("CONTRACT_A,contract,100,"));
+        assert!(lines[2].starts_with("CONTRACT_B,contract,101,"));
+    }
+
+    #[test]
+    fn test_csv_escapes_special_characters() {
+        let mut event = mock_event("CONTRACT_A", 100);
+        event.event_type = "weird,\"type\"".to_string();
+        let csv = generate_csv(&[event]);
+        // Comma/quote-bearing field is wrapped in quotes with quotes doubled.
+        assert!(csv.contains("\"weird,\"\"type\"\"\""));
+    }
+
+    #[test]
+    fn test_generate_json_is_valid_array() {
+        let events = vec![mock_event("CONTRACT_A", 100)];
+        let json = generate_json(&events);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["contractId"], "CONTRACT_A");
+    }
+
+    #[test]
+    fn test_attachment_for_events_csv_and_json() {
+        let events = vec![mock_event("CONTRACT_A", 100)];
+
+        let csv = EmailAttachment::for_events(&events, AttachmentFormat::Csv);
+        assert_eq!(csv.filename, "events.csv");
+        assert_eq!(csv.content_type, "text/csv");
+        assert!(csv.content.contains("CONTRACT_A"));
+
+        let json = EmailAttachment::for_events(&events, AttachmentFormat::Json);
+        assert_eq!(json.filename, "events.json");
+        assert_eq!(json.content_type, "application/json");
+        assert!(json.content.contains("CONTRACT_A"));
+    }
+
+    #[test]
+    fn test_attachment_threshold_logic() {
+        let max_events_in_body = 50;
+        // At or below the threshold: no attachment.
+        let small: Vec<SorobanEvent> = (0..50).map(|i| mock_event("C", 100 + i)).collect();
+        assert!(small.len() <= max_events_in_body);
+        // Above the threshold: attachment is generated.
+        let large: Vec<SorobanEvent> = (0..51).map(|i| mock_event("C", 100 + i)).collect();
+        assert!(large.len() > max_events_in_body);
+        let attachment = EmailAttachment::for_events(&large, AttachmentFormat::Csv);
+        // Header + 51 rows = 52 lines.
+        assert_eq!(attachment.content.lines().count(), 52);
     }
 }

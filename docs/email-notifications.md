@@ -26,6 +26,8 @@ Email notifications are configured via environment variables:
 - `EMAIL_SMTP_USER`: SMTP authentication username (required by most servers)
 - `EMAIL_SMTP_PASSWORD`: SMTP authentication password (required by most servers)
 - `EMAIL_CONTRACT_FILTER`: Comma-separated list of contract IDs to filter notifications
+- `EMAIL_MAX_EVENTS_IN_BODY`: When a digest exceeds this many events, the full list is attached as a file (default: `50`). See [Attachments](#attachments).
+- `EMAIL_ATTACHMENT_FORMAT`: Attachment format when one is generated — `csv` (default) or `json`
 
 ## Example Configuration
 
@@ -106,6 +108,31 @@ Contract: CDEF456...
   - Type: contract, Ledger: 1234572, TxHash: pqr678...
   - Type: system, Ledger: 1234573, TxHash: stu901...
 ```
+
+## Attachments
+
+Issue #481: Large digests (for example a daily digest with hundreds of events) can produce an email body that exceeds client size limits, causing truncation or rejection. To avoid this, when the number of events in a batch exceeds `EMAIL_MAX_EVENTS_IN_BODY` (default `50`), Soroban Pulse attaches the **full** event list as a file and keeps only the per-contract summary in the body.
+
+### Configuration
+
+```bash
+# Attach a file once a digest has more than 100 events
+EMAIL_MAX_EVENTS_IN_BODY=100
+# Attach as CSV (default) or JSON
+EMAIL_ATTACHMENT_FORMAT=csv
+```
+
+### Behavior
+
+- When `event_count <= EMAIL_MAX_EVENTS_IN_BODY`: a plain-text summary email, no attachment (unchanged behavior).
+- When `event_count > EMAIL_MAX_EVENTS_IN_BODY`: a `multipart/mixed` email whose body contains the per-contract summary **plus a note** indicating the full list is attached, and an attached file with every event.
+
+### Attachment formats
+
+| Format | Filename | MIME type | Contents |
+|--------|----------|-----------|----------|
+| `csv` (default) | `events.csv` | `text/csv` | Header row + one row per event: `contract_id,event_type,ledger,ledger_closed_at,tx_hash,in_successful_call` (RFC 4180 escaped) |
+| `json` | `events.json` | `application/json` | Pretty-printed JSON array of the full event objects |
 
 ## Batching Behavior
 

@@ -250,6 +250,11 @@ pub struct Config {
     pub email_from: Option<String>,
     pub email_to: Vec<String>,
     pub email_contract_filter: Vec<String>,
+    // Issue #481: email attachment support
+    /// When the digest event count exceeds this, attach a file (default 50).
+    pub email_max_events_in_body: usize,
+    /// Attachment format when one is generated: csv (default) or json.
+    pub email_attachment_format: String,
     // SMS notification fields (Issue #473)
     pub twilio_account_sid: Option<String>,
     pub twilio_auth_token: Option<SecretString>,
@@ -385,6 +390,8 @@ impl Default for Config {
             email_from: None,
             email_to: Vec::new(),
             email_contract_filter: Vec::new(),
+            email_max_events_in_body: 50,
+            email_attachment_format: "csv".to_string(),
             redis_url: None,
             redis_stream_key: None,
             redis_buffer_max_size: 10_000,
@@ -1169,6 +1176,14 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // Issue #481: email attachment support
+            email_max_events_in_body: env_or_file("EMAIL_MAX_EVENTS_IN_BODY", &file)
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(50),
+            email_attachment_format: env_or_file("EMAIL_ATTACHMENT_FORMAT", &file)
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "csv".to_string()),
             redis_url: env_or_file("REDIS_URL", &file),
             redis_stream_key: env_or_file("REDIS_STREAM_KEY", &file),
             redis_buffer_max_size: env_or_file("REDIS_BUFFER_MAX_SIZE", &file)

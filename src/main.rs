@@ -252,12 +252,15 @@ async fn main() -> anyhow::Result<()> {
                     config.email_to.clone(),
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
+                    config.email_max_events_in_body,
+                    email::AttachmentFormat::parse(&config.email_attachment_format),
                     pool.clone(),
                 );
 
                 info!(
                     smtp_host = %smtp_host,
                     recipients = config.email_to.len(),
+                    max_events_in_body = config.email_max_events_in_body,
                     "Email notifications enabled"
                 );
 
