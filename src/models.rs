@@ -715,6 +715,58 @@ fn default_true() -> bool {
     true
 }
 
+/// A notification channel stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct NotificationChannel {
+    pub id: Uuid,
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for creating a notification channel.
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for updating a notification channel (all fields optional.
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateChannelRequest {
+    pub name: Option<String>,
+    pub config: Option<Value>,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for cloning a channel (optional overrides applied to the copy).
+#[derive(Debug, Deserialize, Default)]
+pub struct CloneChannelRequest {
+    pub name: Option<String>,
+    pub config: Option<Value>,
+    pub retry_policy: Option<Value>,
+}
+
+/// Single channel entry inside an import payload.
+#[derive(Debug, Deserialize)]
+pub struct ImportChannelEntry {
+    pub name: String,
+    pub channel_type: String,
+    pub config: Value,
+    pub retry_policy: Option<Value>,
+}
+
+/// Request body for POST /v1/admin/notifications/channels/import.
+#[derive(Debug, Deserialize)]
+pub struct ImportChannelsRequest {
+    pub channels: Vec<ImportChannelEntry>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

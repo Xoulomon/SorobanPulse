@@ -10167,3 +10167,206 @@ async fn handle_ws_connection(
     let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::metrics::update_ws_connections(count);
 }
+
+// ── Notification Channels ─────────────────────────────────────────────────────
+
+const VALID_CHANNEL_TYPES: &[&str] = &["webhook", "email", "sms"];
+
+const DEFAULT_RETRY_POLICY: &str = r#"{
+    "max_attempts": 3,
+    "initial_backoff_ms": 1000,
+    "backoff_multiplier": 2.0,
+    "max_backoff_ms": 60000
+}"#;
+
+pub async fn list_notification_channels(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let channels = sqlx::query_as::<_, models::NotificationChannel>(
+        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
+         FROM notification_channels ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let total = channels.len();
+    Ok(Json(json!({ "data": channels, "total": total })))
+}
+
+pub async fn get_notification_channel(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let channel = sqlx::query_as::<_, models::NotificationChannel>(
+        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
+         FROM notification_channels WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    Ok(Json(json!(channel)))
+}
+
+pub async fn create_notification_channel(
+    State(state): State<AppState>,
+    Json(req): Json<models::CreateChannelRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if !VALID_CHANNEL_TYPES.contains(&req.channel_type.as_str()) {
+        return Err(AppError::Validation(
+            "channel_type must be one of: webhook, email, sms".to_string(),
+        ));
+    }
+
+    let retry_policy = req.retry_policy.unwrap_or_else(|| {
+        serde_json::from_str(DEFAULT_RETRY_POLICY).unwrap()
+    });
+
+    let channel = sqlx::query_as::<_, models::NotificationChannel>(
+        "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
+    )
+    .bind(&req.name)
+    .bind(&req.channel_type)
+    .bind(&req.config)
+    .bind(&retry_policy)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(json!(channel))))
+}
+
+pub async fn update_notification_channel(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(req): Json<models::UpdateChannelRequest>,
+) -> Result<Json<Value>, AppError> {
+    let existing = sqlx::query_as::<_, models::NotificationChannel>(
+        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
+         FROM notification_channels WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    let new_name = req.name.unwrap_or(existing.name);
+    let new_config = req.config.unwrap_or(existing.config);
+    let new_retry = req.retry_policy.unwrap_or(existing.retry_policy);
+
+    let channel = sqlx::query_as::<_, models::NotificationChannel>(
+        "UPDATE notification_channels
+         SET name = $2, config = $3, retry_policy = $4, updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(&new_name)
+    .bind(&new_config)
+    .bind(&new_retry)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!(channel)))
+}
+
+pub async fn delete_notification_channel(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    let result = sqlx::query("DELETE FROM notification_channels WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /v1/admin/notifications/channels/:id/clone
+///
+/// Creates a copy of the specified channel. The clone gets a " (copy)" name
+/// suffix unless an explicit name override is supplied in the request body.
+/// Any other fields in the body override the corresponding source values.
+pub async fn clone_notification_channel(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    body: Option<Json<models::CloneChannelRequest>>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let source = sqlx::query_as::<_, models::NotificationChannel>(
+        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
+         FROM notification_channels WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    let overrides = body.map(|b| b.0).unwrap_or_default();
+    let cloned_name = overrides
+        .name
+        .unwrap_or_else(|| format!("{} (copy)", source.name));
+    let cloned_config = overrides.config.unwrap_or(source.config);
+    let cloned_retry = overrides.retry_policy.unwrap_or(source.retry_policy);
+
+    let cloned = sqlx::query_as::<_, models::NotificationChannel>(
+        "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
+    )
+    .bind(&cloned_name)
+    .bind(&source.channel_type)
+    .bind(&cloned_config)
+    .bind(&cloned_retry)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(json!(cloned))))
+}
+
+#[cfg(test)]
+mod notification_channel_clone_tests {
+    use super::*;
+
+    #[test]
+    fn clone_name_gets_copy_suffix_when_no_override() {
+        let source_name = "Production Alerts";
+        let override_name: Option<String> = None;
+        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
+        assert_eq!(cloned, "Production Alerts (copy)");
+    }
+
+    #[test]
+    fn clone_name_uses_override_when_provided() {
+        let source_name = "Production Alerts";
+        let override_name = Some("Staging Alerts".to_string());
+        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
+        assert_eq!(cloned, "Staging Alerts");
+    }
+
+    #[test]
+    fn clone_name_nested_copy_suffix() {
+        let source_name = "My Webhook (copy)";
+        let override_name: Option<String> = None;
+        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
+        assert_eq!(cloned, "My Webhook (copy) (copy)");
+    }
+
+    #[test]
+    fn valid_channel_types_accepted() {
+        for t in VALID_CHANNEL_TYPES {
+            assert!(VALID_CHANNEL_TYPES.contains(t));
+        }
+    }
+
+    #[test]
+    fn invalid_channel_type_rejected() {
+        assert!(!VALID_CHANNEL_TYPES.contains(&"slack"));
+        assert!(!VALID_CHANNEL_TYPES.contains(&"push"));
+    }
+}

@@ -401,7 +401,23 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // Notification channel CRUD + clone (#506)
+        .route(
+            "/admin/notifications/channels",
+            get(handlers::list_notification_channels)
+                .post(handlers::create_notification_channel),
+        )
+        .route(
+            "/admin/notifications/channels/{id}",
+            get(handlers::get_notification_channel)
+                .put(handlers::update_notification_channel)
+                .delete(handlers::delete_notification_channel),
+        )
+        .route(
+            "/admin/notifications/channels/{id}/clone",
+            axum::routing::post(handlers::clone_notification_channel),
+        );
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
