@@ -260,18 +260,6 @@ pub struct Config {
     pub webhook_retry_policy: crate::retry_policy::RetryPolicy,
     pub email_retry_policy: crate::retry_policy::RetryPolicy,
     pub sms_retry_policy: crate::retry_policy::RetryPolicy,
-    // SMS notification fields (Issue #473)
-    pub twilio_account_sid: Option<String>,
-    pub twilio_auth_token: Option<SecretString>,
-    pub twilio_from_number: Option<String>,
-    pub sms_to_numbers: Vec<String>,
-    pub sms_contract_filter: Vec<String>,
-    // Notification retry policies (Issue #474)
-    pub webhook_retry_policy: crate::retry_policy::RetryPolicy,
-    pub email_retry_policy: crate::retry_policy::RetryPolicy,
-    pub sms_retry_policy: crate::retry_policy::RetryPolicy,
-    pub email_to: Vec<String>,
-    pub email_contract_filter: Vec<String>,
     // Redis stream fields
     pub redis_url: Option<String>,
     pub redis_stream_key: Option<String>,
@@ -317,6 +305,24 @@ pub struct Config {
     
     // Stats cache TTL
     pub stats_cache_ttl_secs: u64,
+    /// Grace period (ms) between SSE close-event broadcast and dropping the broadcast sender.
+    pub sse_shutdown_grace_period_ms: u64,
+    // Email digest grouping by contract (Issue #491)
+    pub email_max_contracts_in_digest: usize,
+    // Notification priority levels (Issue #492)
+    pub notification_default_priority: String,
+    pub notification_priority_rule_path: Option<String>,
+    pub notification_priority_rule_value: Option<String>,
+    pub notification_priority_rule_priority: Option<String>,
+    // Escalation policy (Issue #493)
+    pub escalation_primary_channel: Option<String>,
+    pub escalation_channel: Option<String>,
+    pub escalation_delay_minutes: u64,
+    // On-call rotation integration (Issue #494)
+    pub oncall_provider: Option<String>,
+    pub oncall_pagerduty_api_key: Option<SecretString>,
+    pub oncall_schedule_id: Option<String>,
+    pub oncall_schedule_cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -417,6 +423,27 @@ impl Default for Config {
             pagerduty_auto_resolve: true,
             pagerduty_auto_resolve_threshold_minutes: 30,
             stats_cache_ttl_secs: 30,
+            twilio_account_sid: None,
+            twilio_auth_token: None,
+            twilio_from_number: None,
+            sms_to_numbers: Vec::new(),
+            sms_contract_filter: Vec::new(),
+            webhook_retry_policy: crate::retry_policy::RetryPolicy::webhook_default(),
+            email_retry_policy: crate::retry_policy::RetryPolicy::email_default(),
+            sms_retry_policy: crate::retry_policy::RetryPolicy::sms_default(),
+            sse_shutdown_grace_period_ms: 200,
+            email_max_contracts_in_digest: 20,
+            notification_default_priority: "medium".to_string(),
+            notification_priority_rule_path: None,
+            notification_priority_rule_value: None,
+            notification_priority_rule_priority: None,
+            escalation_primary_channel: None,
+            escalation_channel: None,
+            escalation_delay_minutes: 30,
+            oncall_provider: None,
+            oncall_pagerduty_api_key: None,
+            oncall_schedule_id: None,
+            oncall_schedule_cache_ttl_secs: 300,
         }
     }
 }
@@ -1265,6 +1292,51 @@ impl Config {
             stats_cache_ttl_secs: env_or_file("STATS_CACHE_TTL_SECS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            twilio_account_sid: env_or_file("TWILIO_ACCOUNT_SID", &file),
+            twilio_auth_token: env_or_file("TWILIO_AUTH_TOKEN", &file).map(SecretString::new),
+            twilio_from_number: env_or_file("TWILIO_FROM_NUMBER", &file),
+            sms_to_numbers: env_or_file("SMS_TO_NUMBERS", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            sms_contract_filter: env_or_file("SMS_CONTRACT_FILTER", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            webhook_retry_policy: crate::retry_policy::RetryPolicy::webhook_default(),
+            email_retry_policy: crate::retry_policy::RetryPolicy::email_default(),
+            sms_retry_policy: crate::retry_policy::RetryPolicy::sms_default(),
+            sse_shutdown_grace_period_ms: env_or_file("SSE_SHUTDOWN_GRACE_PERIOD_MS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200),
+            email_max_contracts_in_digest: env_or_file("EMAIL_MAX_CONTRACTS_IN_DIGEST", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+            notification_default_priority: env_or_file("NOTIFICATION_DEFAULT_PRIORITY", &file)
+                .unwrap_or_else(|| "medium".to_string()),
+            notification_priority_rule_path: env_or_file("NOTIFICATION_PRIORITY_RULE_PATH", &file),
+            notification_priority_rule_value: env_or_file("NOTIFICATION_PRIORITY_RULE_VALUE", &file),
+            notification_priority_rule_priority: env_or_file("NOTIFICATION_PRIORITY_RULE_PRIORITY", &file),
+            escalation_primary_channel: env_or_file("ESCALATION_PRIMARY_CHANNEL", &file),
+            escalation_channel: env_or_file("ESCALATION_CHANNEL", &file),
+            escalation_delay_minutes: env_or_file("ESCALATION_DELAY_MINUTES", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            oncall_provider: env_or_file("ONCALL_PROVIDER", &file),
+            oncall_pagerduty_api_key: env_or_file("ONCALL_PAGERDUTY_API_KEY", &file)
+                .map(SecretString::new),
+            oncall_schedule_id: env_or_file("ONCALL_SCHEDULE_ID", &file),
+            oncall_schedule_cache_ttl_secs: env_or_file("ONCALL_SCHEDULE_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         }
     }
 }

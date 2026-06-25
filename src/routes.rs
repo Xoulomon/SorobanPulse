@@ -401,7 +401,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // Issue #493: Notification acknowledgment endpoint
+        .route("/notifications/{id}/ack", axum::routing::post(handlers::acknowledge_notification))
+        // Issue #494: On-call rotation endpoint
+        .route("/oncall/current", get(handlers::get_current_oncall));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

@@ -5,6 +5,8 @@ The email notification feature allows operators to receive email alerts when spe
 ## Features
 
 - **Batched Notifications**: Events are batched and sent as a single email every minute to avoid flooding recipients
+- **Digest Grouped by Contract**: Each digest email groups events by contract ID with a per-contract summary (Issue #491)
+- **Priority Levels**: Critical events are delivered immediately; low-priority events stay in the digest (Issue #492)
 - **Contract Filtering**: Optional filtering to only receive notifications for specific contracts
 - **SMTP Support**: Works with any SMTP server (Gmail, SendGrid, AWS SES, etc.)
 - **Multiple Recipients**: Send notifications to multiple email addresses
@@ -168,3 +170,77 @@ Monitor this metric to detect SMTP configuration issues or delivery failures.
 | Best for | Alerts, monitoring | Integrations, automation |
 
 Use email notifications for human-readable alerts and monitoring. Use webhooks for system integrations and real-time event processing.
+
+---
+
+## Digest Grouping by Contract (Issue #491)
+
+Email digests group events by `contract_id`, making it much easier to scan
+activity across many contracts at once.
+
+Each contract section in the digest shows:
+- **Contract ID** — full identifier
+- **Event count** — total events in this batch
+- **Type breakdown** — count per event type (e.g. `contract: 12, diagnostic: 3`)
+- **First / last timestamp** — ledger close times bounding this batch
+
+### Limiting Contracts per Digest
+
+When monitoring a large number of contracts, set `EMAIL_MAX_CONTRACTS_IN_DIGEST`
+to cap how many contracts appear in a single digest. Contracts are sorted by
+event count (most active first). A footer line reports how many additional
+contracts were omitted.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMAIL_MAX_CONTRACTS_IN_DIGEST` | `20` | Maximum contracts shown per digest email |
+
+**Example footer when limit is reached:**
+
+> … and 14 more contracts not shown. Set `EMAIL_MAX_CONTRACTS_IN_DIGEST` to a higher value to see all.
+
+---
+
+## Notification Priority Levels (Issue #492)
+
+Assign a priority level to notifications to control delivery urgency.
+
+| Priority | Email behaviour |
+|---|---|
+| `critical` | Sent **immediately**, bypassing the 1-minute batch window |
+| `high` | Included in the next batch digest |
+| `medium` | Included in the next batch digest (default) |
+| `low` | Included in the next batch digest |
+
+### Default Priority
+
+Set `NOTIFICATION_DEFAULT_PRIORITY` to the fallback priority when no rule matches.
+
+```bash
+NOTIFICATION_DEFAULT_PRIORITY=medium
+```
+
+### Dynamic Priority Rules (JSONPath)
+
+Use `NOTIFICATION_PRIORITY_RULE_PATH`, `NOTIFICATION_PRIORITY_RULE_VALUE`, and
+`NOTIFICATION_PRIORITY_RULE_PRIORITY` to assign a priority based on the event's
+`value` field:
+
+```bash
+# Mark any event whose event_data.action == "liquidate" as critical
+NOTIFICATION_PRIORITY_RULE_PATH=$.action
+NOTIFICATION_PRIORITY_RULE_VALUE=liquidate
+NOTIFICATION_PRIORITY_RULE_PRIORITY=critical
+```
+
+The rule uses a simple JSONPath expression (dot-separated keys, e.g. `$.a.b`).
+If the field at the path equals the expected value, the rule priority is applied;
+otherwise the default priority is used.
+
+### Priority in Email Subject
+
+The digest subject line includes the highest priority present in the batch:
+
+```
+[CRITICAL] Soroban Pulse: 42 events across 5 contracts
+```

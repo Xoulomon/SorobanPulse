@@ -10167,3 +10167,148 @@ async fn handle_ws_connection(
     let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::metrics::update_ws_connections(count);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #493 — Notification acknowledgment endpoint
+// ---------------------------------------------------------------------------
+
+/// Acknowledge a notification, preventing escalation to the secondary channel.
+///
+/// Once acknowledged, the notification's status transitions from `pending` to
+/// `acknowledged` and the escalation background task will skip it.
+#[utoipa::path(
+    post,
+    path = "/v1/notifications/{id}/ack",
+    tag = "events",
+    params(
+        ("id" = Uuid, Path, description = "Notification ID returned when the notification was delivered"),
+    ),
+    responses(
+        (status = 200, description = "Notification acknowledged"),
+        (status = 404, description = "Notification not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub async fn acknowledge_notification(
+    State(state): State<AppState>,
+    Path(notification_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let rows_affected = sqlx::query(
+        "UPDATE notification_acknowledgments \
+         SET status = 'acknowledged', acknowledged_at = NOW() \
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(notification_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "Failed to acknowledge notification");
+        AppError::Internal(e.to_string())
+    })?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    tracing::info!(notification_id = %notification_id, "Notification acknowledged");
+    Ok(Json(serde_json::json!({
+        "acknowledged": true,
+        "notification_id": notification_id,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #493 — Escalation check (called by a background task or admin trigger)
+// ---------------------------------------------------------------------------
+
+/// Escalate all notifications that have been pending for longer than the
+/// configured `escalation_delay_minutes`.  This is intended to be called
+/// periodically by a background task or from the admin API.
+pub async fn escalate_overdue_notifications(
+    pool: &sqlx::PgPool,
+    escalation_channel: &str,
+    delay_minutes: u64,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "UPDATE notification_acknowledgments \
+         SET status = 'escalated', \
+             escalated_at = NOW(), \
+             escalation_channel = $1 \
+         WHERE status = 'pending' \
+           AND created_at < NOW() - ($2 * INTERVAL '1 minute')",
+    )
+    .bind(escalation_channel)
+    .bind(delay_minutes as i64)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if affected > 0 {
+        tracing::warn!(
+            count = affected,
+            escalation_channel = %escalation_channel,
+            "Escalated overdue notifications"
+        );
+    }
+
+    Ok(affected)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #494 — On-call rotation handler
+// ---------------------------------------------------------------------------
+
+/// Return the current on-call engineer based on the configured on-call provider.
+///
+/// The result is cached for `oncall_schedule_cache_ttl_secs` (default 5 minutes)
+/// to avoid excessive API calls.
+#[utoipa::path(
+    get,
+    path = "/v1/oncall/current",
+    tag = "system",
+    responses(
+        (status = 200, description = "Current on-call engineer contact information"),
+        (status = 204, description = "No on-call provider configured"),
+        (status = 503, description = "On-call provider unreachable"),
+    )
+)]
+pub async fn get_current_oncall(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let config = &state.config;
+
+    let provider = match config.oncall_provider.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return Ok((
+                StatusCode::NO_CONTENT,
+                Json(serde_json::json!({"oncall_provider": null})),
+            )
+                .into_response());
+        }
+    };
+
+    let scheduler = crate::oncall::OnCallScheduler::from_config(config);
+
+    match scheduler {
+        None => Ok((
+            StatusCode::NO_CONTENT,
+            Json(serde_json::json!({"oncall_provider": null})),
+        )
+            .into_response()),
+        Some(s) => match s.current_oncall().await {
+            Some(contact) => Ok(Json(serde_json::json!({
+                "oncall_provider": provider,
+                "user_name": contact.user_name,
+                "user_email": contact.user_email,
+                "user_phone": contact.user_phone,
+                "schedule_id": contact.schedule_id,
+            }))
+            .into_response()),
+            None => Err(AppError::Internal(format!(
+                "Failed to resolve on-call from provider '{provider}'"
+            ))),
+        },
+    }
+}

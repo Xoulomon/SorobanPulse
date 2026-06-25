@@ -38,6 +38,12 @@ mod subscriptions;
 mod webhook;
 mod notification_formatter;
 mod pagerduty;
+mod retry_policy;
+mod sms;
+mod aggregation;
+mod saved_queries;
+mod abi;
+mod oncall;
 mod xdr_validation;
 
 #[cfg(feature = "archive")]
@@ -217,13 +223,21 @@ async fn main() -> anyhow::Result<()> {
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
                         let pool_ref = Some(pool.as_ref());
+                        let priority = webhook::evaluate_priority(
+                            &event,
+                            config.notification_priority_rule_path.as_deref(),
+                            config.notification_priority_rule_value.as_deref(),
+                            config.notification_priority_rule_priority.as_deref(),
+                            &config.notification_default_priority,
+                        ).to_string();
                         tokio::spawn(webhook::deliver_with_retry_policy(
-                            client, 
-                            url, 
-                            secret, 
-                            event, 
+                            client,
+                            url,
+                            secret,
+                            event,
                             pool_ref,
-                            &config.webhook_retry_policy
+                            &config.webhook_retry_policy,
+                            priority,
                         ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -253,6 +267,13 @@ async fn main() -> anyhow::Result<()> {
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
                     pool.clone(),
+                )
+                .with_digest_config(
+                    config.email_max_contracts_in_digest,
+                    config.notification_default_priority.clone(),
+                    config.notification_priority_rule_path.clone(),
+                    config.notification_priority_rule_value.clone(),
+                    config.notification_priority_rule_priority.clone(),
                 );
 
                 info!(

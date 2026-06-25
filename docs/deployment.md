@@ -777,3 +777,122 @@ Expected output on PostgreSQL 14+:
 ```
 
 (`x` = EXTENDED, `l` = lz4)
+
+---
+
+## On-Call Rotation Integration (Issue #494)
+
+Soroban Pulse can route notifications to the engineer currently on-call in your
+rotation system. When configured, the on-call contact is resolved from the
+provider's API and cached locally for a configurable TTL (default 5 minutes) to
+prevent excessive API calls during high-volume alert periods.
+
+### Supported Providers
+
+| `ONCALL_PROVIDER` | Description |
+|---|---|
+| `pagerduty` | PagerDuty Schedules API v2 |
+| `opsgenie` | Atlassian OpsGenie On-Call API |
+| `victorops` | Splunk On-Call (VictorOps) API |
+
+### Configuration Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ONCALL_PROVIDER` | _(unset)_ | On-call provider: `pagerduty`, `opsgenie`, or `victorops` |
+| `ONCALL_PAGERDUTY_API_KEY` | _(unset)_ | PagerDuty REST API token (for `pagerduty` provider) |
+| `ONCALL_SCHEDULE_ID` | _(unset)_ | Schedule or rotation ID to query for the current on-call user |
+| `ONCALL_SCHEDULE_CACHE_TTL_SECS` | `300` | How long to cache the resolved on-call contact (seconds) |
+
+### API Endpoint
+
+```
+GET /v1/oncall/current
+```
+
+Returns the currently on-call engineer's name, email address, and the schedule
+ID that was queried. Returns `204 No Content` when no provider is configured.
+
+**Example response:**
+```json
+{
+  "oncall_provider": "pagerduty",
+  "user_name": "Alice Engineer",
+  "user_email": "alice@example.com",
+  "user_phone": null,
+  "schedule_id": "PABC123"
+}
+```
+
+### Example — PagerDuty
+
+```bash
+ONCALL_PROVIDER=pagerduty
+ONCALL_PAGERDUTY_API_KEY=u+xxxxxxxxxxxx
+ONCALL_SCHEDULE_ID=PABC123
+ONCALL_SCHEDULE_CACHE_TTL_SECS=300
+```
+
+The Soroban Pulse notification system will add the on-call engineer's email as an
+additional recipient when `EMAIL_SMTP_HOST` is also configured, ensuring that
+every critical alert reaches the engineer currently responsible.
+
+### Cache Invalidation
+
+The on-call schedule is re-fetched automatically after the TTL expires. To force
+an immediate refresh (for example, after a manual rotation change), restart the
+service or call `DELETE /v1/oncall/cache` (if enabled via admin routes).
+
+---
+
+## Escalation Policy (Issue #493)
+
+When a notification is not acknowledged within `ESCALATION_DELAY_MINUTES`, it is
+automatically escalated to a secondary channel (`ESCALATION_CHANNEL`).
+
+### Configuration Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ESCALATION_PRIMARY_CHANNEL` | _(unset)_ | Primary notification channel identifier |
+| `ESCALATION_CHANNEL` | _(unset)_ | Secondary channel to escalate unacknowledged notifications to |
+| `ESCALATION_DELAY_MINUTES` | `30` | Minutes before an unacknowledged notification is escalated |
+
+### Acknowledging a Notification
+
+```
+POST /v1/notifications/{id}/ack
+```
+
+Marks the notification as acknowledged. After acknowledgment, escalation is
+suppressed for that notification.
+
+---
+
+## Notification Priority Levels (Issue #492)
+
+Notifications can be assigned a priority level that controls delivery behaviour.
+
+| Priority | Delivery |
+|---|---|
+| `critical` | Immediate — bypasses the digest batch window |
+| `high` | Batched with the next digest cycle |
+| `medium` | Batched (default) |
+| `low` | Batched; included only in digest emails |
+
+### Dynamic Priority Rules
+
+Set `NOTIFICATION_PRIORITY_RULE_PATH` to a JSONPath expression (e.g. `$.action`),
+`NOTIFICATION_PRIORITY_RULE_VALUE` to the comparison value, and
+`NOTIFICATION_PRIORITY_RULE_PRIORITY` to the priority to assign when the rule
+matches.
+
+```bash
+NOTIFICATION_PRIORITY_RULE_PATH=$.action
+NOTIFICATION_PRIORITY_RULE_VALUE=liquidate
+NOTIFICATION_PRIORITY_RULE_PRIORITY=critical
+NOTIFICATION_DEFAULT_PRIORITY=medium
+```
+
+In this example, any event whose `event_data.action` equals `"liquidate"` will be
+marked `critical` and delivered immediately.
