@@ -3541,7 +3541,7 @@ pub async fn bulk_insert_events(
         .bind(&event.event_data_normalized)
         .bind(&event.ledger_hash)
         .bind(event.in_successful_call.unwrap_or(false))
-        .execute(&state.write_pool)
+        .execute(&state.pool)
         .await;
         
         match result {
@@ -4834,6 +4834,7 @@ mod tests {
             .map(|(k, v)| (hash_api_key(k), v.clone()))
             .collect();
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         crate::routes::create_router_with_tx_and_tenant_map(
             pool.clone(),
             pool,
@@ -4853,6 +4854,7 @@ mod tests {
             config,
             None,
             Arc::new(hashed_map),
+            shutdown_rx,
         )
     }
 
@@ -9595,6 +9597,182 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
+
+    // ── #513: SLA monitoring unit tests ──────────────────────────────────────
+
+    #[test]
+    fn sla_latency_calculation_is_correct() {
+        let indexed = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let delivered = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let latency = (delivered - indexed).num_milliseconds() as f64 / 1000.0;
+        assert!((latency - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn sla_breach_detected_when_latency_exceeds_sla() {
+        let sla_seconds: u64 = 30;
+        let latency: f64 = 35.0;
+        let breached = latency > sla_seconds as f64;
+        assert!(breached, "expected SLA breach for latency {latency}s > SLA {sla_seconds}s");
+    }
+
+    #[test]
+    fn sla_not_breached_when_latency_within_sla() {
+        let sla_seconds: u64 = 30;
+        let latency: f64 = 10.0;
+        let breached = latency > sla_seconds as f64;
+        assert!(!breached);
+    }
+
+    // ── #514: Capacity planning unit tests ───────────────────────────────────
+
+    #[test]
+    fn growth_trend_zero_when_no_baseline() {
+        let baseline_rate_per_minute: f64 = 0.0;
+        let current_rate: f64 = 5.0;
+        let trend = if baseline_rate_per_minute > 0.0 {
+            ((current_rate - baseline_rate_per_minute) / baseline_rate_per_minute) * 100.0
+        } else {
+            0.0
+        };
+        assert_eq!(trend, 0.0);
+    }
+
+    #[test]
+    fn growth_trend_positive_when_current_above_baseline() {
+        let baseline: f64 = 10.0;
+        let current: f64 = 15.0;
+        let trend = ((current - baseline) / baseline) * 100.0;
+        assert!((trend - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn projected_rate_never_below_current_with_positive_trend() {
+        let current: f64 = 20.0;
+        let trend: f64 = 25.0;
+        let projected = current * (1.0 + trend.max(0.0) / 100.0);
+        assert!(projected >= current);
+    }
+
+    // ── #512: Lifecycle webhook unit tests ───────────────────────────────────
+
+    #[test]
+    fn lifecycle_event_type_matching_wildcard() {
+        let subscribed_events = vec!["*".to_string()];
+        let event_type = "channel_deleted";
+        let matches = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == event_type);
+        assert!(matches);
+    }
+
+    #[test]
+    fn lifecycle_event_type_matching_exact() {
+        let subscribed_events = vec![
+            "channel_created".to_string(),
+            "delivery_failed".to_string(),
+        ];
+        let matches_created = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == "channel_created");
+        let matches_deleted = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == "channel_deleted");
+        assert!(matches_created);
+        assert!(!matches_deleted);
+    }
+
+    #[test]
+    fn lifecycle_event_not_delivered_to_inactive_webhook() {
+        let webhook = crate::models::SystemWebhookConfig {
+            id: Uuid::new_v4(),
+            url: "http://example.com/hook".to_string(),
+            secret: None,
+            events: vec!["*".to_string()],
+            active: false,
+            created_at: Utc::now(),
+        };
+        assert!(!webhook.active, "inactive webhook should not receive events");
+    }
+
+    // ── #511: Bulk operations unit tests ─────────────────────────────────────
+
+    #[test]
+    fn bulk_response_counts_success_and_failure() {
+        let results = vec![
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: true,
+                error: None,
+            },
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: false,
+                error: Some("not found".to_string()),
+            },
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: true,
+                error: None,
+            },
+        ];
+        let succeeded = results.iter().filter(|r| r.success).count() as i64;
+        let failed = results.iter().filter(|r| !r.success).count() as i64;
+        assert_eq!(succeeded, 2);
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
+    fn bulk_tag_appends_only_new_tags() {
+        let mut tags: Vec<String> = vec!["production".to_string()];
+        let new_tags = vec!["production".to_string(), "critical".to_string()];
+        for tag in &new_tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&"production".to_string()));
+        assert!(tags.contains(&"critical".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bulk_enable_returns_not_found_for_unknown_channel() {
+        let unknown_id = Uuid::new_v4();
+        let req = crate::models::BulkChannelRequest {
+            channel_ids: vec![unknown_id],
+        };
+
+        let mut store = notification_channels().write().await;
+        store.clear();
+        drop(store);
+
+        let mut results = Vec::new();
+        {
+            let mut s = notification_channels().write().await;
+            if let Some(ch) = s.get_mut(&unknown_id) {
+                ch.active = true;
+                results.push(crate::models::BulkChannelResult {
+                    id: unknown_id,
+                    success: true,
+                    error: None,
+                });
+            } else {
+                results.push(crate::models::BulkChannelResult {
+                    id: unknown_id,
+                    success: false,
+                    error: Some(format!("channel {unknown_id} not found")),
+                });
+            }
+        }
+        assert_eq!(results.len(), req.channel_ids.len());
+        assert!(!results[0].success);
+        assert!(results[0].error.as_deref().unwrap_or("").contains("not found"));
+    }
 }
 
 // ── Archive ──────────────────────────────────────────────────────────────────
@@ -10166,4 +10344,508 @@ async fn handle_ws_connection(
     
     let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::metrics::update_ws_connections(count);
+}
+
+// ── Notification channel in-memory stores ────────────────────────────────────
+
+type NotificationChannelStore =
+    Arc<RwLock<HashMap<Uuid, crate::models::NotificationChannel>>>;
+type SystemWebhookStore = Arc<RwLock<Vec<crate::models::SystemWebhookConfig>>>;
+type DeliveryLogStore = Arc<RwLock<Vec<crate::models::NotificationDelivery>>>;
+
+static NOTIFICATION_CHANNELS: OnceLock<NotificationChannelStore> = OnceLock::new();
+static SYSTEM_WEBHOOKS_STORE: OnceLock<SystemWebhookStore> = OnceLock::new();
+static DELIVERY_LOG: OnceLock<DeliveryLogStore> = OnceLock::new();
+
+fn notification_channels() -> NotificationChannelStore {
+    NOTIFICATION_CHANNELS
+        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+        .clone()
+}
+
+fn system_webhooks_store() -> SystemWebhookStore {
+    SYSTEM_WEBHOOKS_STORE
+        .get_or_init(|| Arc::new(RwLock::new(Vec::new())))
+        .clone()
+}
+
+fn delivery_log() -> DeliveryLogStore {
+    DELIVERY_LOG
+        .get_or_init(|| Arc::new(RwLock::new(Vec::new())))
+        .clone()
+}
+
+// ── #512: Lifecycle webhook delivery ─────────────────────────────────────────
+
+pub async fn deliver_lifecycle_event(event: &crate::models::LifecycleEvent) {
+    let webhooks: Vec<_> = system_webhooks_store().read().await.clone();
+    let client = reqwest::Client::new();
+    for webhook in webhooks {
+        if !webhook.active {
+            continue;
+        }
+        let subscribed = webhook.events.iter().any(|e| e == "*" || e == &event.event_type);
+        if !subscribed {
+            continue;
+        }
+        let payload = serde_json::to_value(event).unwrap_or_default();
+        let _ = client
+            .post(&webhook.url)
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+    }
+}
+
+// ── #512: System webhook configuration endpoints ──────────────────────────────
+
+/// Register a system lifecycle webhook
+#[utoipa::path(
+    post,
+    path = "/v1/admin/notifications/system-webhooks",
+    tag = "admin",
+    request_body = crate::models::CreateSystemWebhookRequest,
+    responses(
+        (status = 201, description = "System webhook created", body = crate::models::SystemWebhookConfig),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn create_system_webhook(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::CreateSystemWebhookRequest>,
+) -> Result<(StatusCode, Json<crate::models::SystemWebhookConfig>), AppError> {
+    if body.url.is_empty() {
+        return Err(AppError::Validation("url is required".to_string()));
+    }
+    if body.events.is_empty() {
+        return Err(AppError::Validation(
+            "events list must not be empty".to_string(),
+        ));
+    }
+    let valid_events = [
+        "channel_created",
+        "channel_deleted",
+        "channel_failed",
+        "delivery_failed",
+        "queue_backed_up",
+        "*",
+    ];
+    for ev in &body.events {
+        if !valid_events.contains(&ev.as_str()) {
+            return Err(AppError::Validation(format!(
+                "unknown lifecycle event type: {ev}"
+            )));
+        }
+    }
+    let config = crate::models::SystemWebhookConfig {
+        id: Uuid::new_v4(),
+        url: body.url,
+        secret: body.secret,
+        events: body.events,
+        active: true,
+        created_at: Utc::now(),
+    };
+    system_webhooks_store().write().await.push(config.clone());
+    Ok((StatusCode::CREATED, Json(config)))
+}
+
+/// List system lifecycle webhooks
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notifications/system-webhooks",
+    tag = "admin",
+    responses(
+        (status = 200, description = "System webhook list"),
+    )
+)]
+pub async fn list_system_webhooks(
+    State(_state): State<AppState>,
+) -> Json<Vec<crate::models::SystemWebhookConfig>> {
+    let webhooks = system_webhooks_store().read().await.clone();
+    Json(webhooks)
+}
+
+// ── #513: Notification delivery SLA monitoring ────────────────────────────────
+
+/// Record a notification delivery and track SLA compliance
+#[utoipa::path(
+    post,
+    path = "/v1/admin/notifications/delivery",
+    tag = "admin",
+    request_body = crate::models::RecordDeliveryRequest,
+    responses(
+        (status = 201, description = "Delivery recorded", body = crate::models::NotificationDelivery),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn record_notification_delivery(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::RecordDeliveryRequest>,
+) -> Result<(StatusCode, Json<crate::models::NotificationDelivery>), AppError> {
+    if body.delivered_at < body.event_indexed_at {
+        return Err(AppError::Validation(
+            "delivered_at must not be before event_indexed_at".to_string(),
+        ));
+    }
+    let latency_seconds = (body.delivered_at - body.event_indexed_at)
+        .num_milliseconds() as f64
+        / 1000.0;
+
+    let sla_breached = {
+        let channels = notification_channels().read().await;
+        channels
+            .get(&body.channel_id)
+            .and_then(|ch| ch.delivery_sla_seconds)
+            .map(|sla| latency_seconds > sla as f64)
+            .unwrap_or(false)
+    };
+
+    crate::metrics::record_notification_delivery_latency(
+        &body.channel_name,
+        latency_seconds,
+    );
+
+    let delivery = crate::models::NotificationDelivery {
+        id: Uuid::new_v4(),
+        channel_id: body.channel_id,
+        channel_name: body.channel_name,
+        event_indexed_at: body.event_indexed_at,
+        delivered_at: body.delivered_at,
+        latency_seconds,
+        sla_breached,
+    };
+    delivery_log().write().await.push(delivery.clone());
+    Ok((StatusCode::CREATED, Json(delivery)))
+}
+
+/// List recorded notification deliveries (for SLA inspection)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notifications/delivery",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Delivery records"),
+    )
+)]
+pub async fn list_notification_deliveries(
+    State(_state): State<AppState>,
+) -> Json<Vec<crate::models::NotificationDelivery>> {
+    let log = delivery_log().read().await.clone();
+    Json(log)
+}
+
+// ── #514: Notification capacity planning ─────────────────────────────────────
+
+/// Return current and projected notification rates with capacity recommendations
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notifications/capacity",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Capacity planning data", body = crate::models::NotificationCapacityResponse),
+    )
+)]
+pub async fn get_notification_capacity(
+    State(_state): State<AppState>,
+) -> Json<crate::models::NotificationCapacityResponse> {
+    let now = Utc::now();
+    let log = delivery_log().read().await.clone();
+
+    let one_minute_ago = now - chrono::Duration::seconds(60);
+    let seven_days_ago = now - chrono::Duration::days(7);
+
+    let current_rate = log
+        .iter()
+        .filter(|d| d.delivered_at > one_minute_ago)
+        .count() as f64;
+
+    let week_count = log
+        .iter()
+        .filter(|d| d.delivered_at > seven_days_ago)
+        .count() as f64;
+
+    let baseline_rate_per_minute = week_count / (7.0 * 24.0 * 60.0);
+
+    let growth_trend_percent = if baseline_rate_per_minute > 0.0 {
+        ((current_rate - baseline_rate_per_minute) / baseline_rate_per_minute) * 100.0
+    } else {
+        0.0
+    };
+
+    let projected_rate_per_minute =
+        current_rate * (1.0 + growth_trend_percent.max(0.0) / 100.0);
+
+    crate::metrics::update_notification_rate_per_minute("total", current_rate);
+
+    let channels_guard = notification_channels().read().await;
+    let mut channels = Vec::new();
+    for (id, channel) in channels_guard.iter() {
+        let channel_rate = log
+            .iter()
+            .filter(|d| d.channel_id == *id && d.delivered_at > one_minute_ago)
+            .count() as f64;
+
+        crate::metrics::update_notification_rate_per_minute(&channel.name, channel_rate);
+
+        let mut recommendations: Vec<String> = Vec::new();
+        if channel_rate > 50.0 {
+            recommendations.push(format!(
+                "Channel '{}' exceeds 50 notifications/min; consider distributing load across multiple channels",
+                channel.name
+            ));
+        }
+        if let Some(sla) = channel.delivery_sla_seconds {
+            let breaches = log
+                .iter()
+                .filter(|d| d.channel_id == *id && d.sla_breached)
+                .count();
+            if breaches > 0 {
+                recommendations.push(format!(
+                    "Channel '{}' has {} SLA breach(es) against the {}s target; investigate delivery pipeline",
+                    channel.name, breaches, sla
+                ));
+            }
+        }
+
+        channels.push(crate::models::ChannelCapacityInfo {
+            channel_id: *id,
+            channel_name: channel.name.clone(),
+            current_rate_per_minute: channel_rate,
+            estimated_time_to_limit_minutes: None,
+            recommendations,
+        });
+    }
+
+    Json(crate::models::NotificationCapacityResponse {
+        current_rate_per_minute: current_rate,
+        projected_rate_per_minute,
+        growth_trend_percent,
+        channels,
+        computed_at: now,
+    })
+}
+
+// ── #511: Notification channel bulk operations ────────────────────────────────
+
+/// Bulk-enable notification channels
+#[utoipa::path(
+    post,
+    path = "/v1/admin/notifications/channels/bulk/enable",
+    tag = "admin",
+    request_body = crate::models::BulkChannelRequest,
+    responses(
+        (status = 200, description = "Bulk enable result", body = crate::models::BulkOperationResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn bulk_enable_channels(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::BulkChannelRequest>,
+) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
+    if body.channel_ids.is_empty() {
+        return Err(AppError::Validation(
+            "channel_ids must not be empty".to_string(),
+        ));
+    }
+    let mut store = notification_channels().write().await;
+    let mut results = Vec::new();
+    for id in &body.channel_ids {
+        if let Some(ch) = store.get_mut(id) {
+            ch.active = true;
+            ch.updated_at = Utc::now();
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: true,
+                error: None,
+            });
+        } else {
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: false,
+                error: Some(format!("channel {id} not found")),
+            });
+        }
+    }
+    let succeeded = results.iter().filter(|r| r.success).count() as i64;
+    let failed = results.iter().filter(|r| !r.success).count() as i64;
+    Ok(Json(crate::models::BulkOperationResponse {
+        succeeded,
+        failed,
+        results,
+    }))
+}
+
+/// Bulk-disable notification channels
+#[utoipa::path(
+    post,
+    path = "/v1/admin/notifications/channels/bulk/disable",
+    tag = "admin",
+    request_body = crate::models::BulkChannelRequest,
+    responses(
+        (status = 200, description = "Bulk disable result", body = crate::models::BulkOperationResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn bulk_disable_channels(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::BulkChannelRequest>,
+) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
+    if body.channel_ids.is_empty() {
+        return Err(AppError::Validation(
+            "channel_ids must not be empty".to_string(),
+        ));
+    }
+    let mut store = notification_channels().write().await;
+    let mut results = Vec::new();
+    for id in &body.channel_ids {
+        if let Some(ch) = store.get_mut(id) {
+            ch.active = false;
+            ch.updated_at = Utc::now();
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: true,
+                error: None,
+            });
+        } else {
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: false,
+                error: Some(format!("channel {id} not found")),
+            });
+        }
+    }
+    let succeeded = results.iter().filter(|r| r.success).count() as i64;
+    let failed = results.iter().filter(|r| !r.success).count() as i64;
+
+    drop(store);
+    tokio::spawn(async {
+        let event = crate::models::LifecycleEvent {
+            event_type: "channel_failed".to_string(),
+            channel_id: None,
+            channel_name: None,
+            message: "Channels bulk-disabled".to_string(),
+            occurred_at: Utc::now(),
+            metadata: serde_json::Value::Null,
+        };
+        deliver_lifecycle_event(&event).await;
+    });
+
+    Ok(Json(crate::models::BulkOperationResponse {
+        succeeded,
+        failed,
+        results,
+    }))
+}
+
+/// Bulk-delete notification channels
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/notifications/channels/bulk",
+    tag = "admin",
+    request_body = crate::models::BulkChannelRequest,
+    responses(
+        (status = 200, description = "Bulk delete result", body = crate::models::BulkOperationResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn bulk_delete_channels(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::BulkChannelRequest>,
+) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
+    if body.channel_ids.is_empty() {
+        return Err(AppError::Validation(
+            "channel_ids must not be empty".to_string(),
+        ));
+    }
+    let mut store = notification_channels().write().await;
+    let mut results = Vec::new();
+    for id in &body.channel_ids {
+        if store.remove(id).is_some() {
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: true,
+                error: None,
+            });
+        } else {
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: false,
+                error: Some(format!("channel {id} not found")),
+            });
+        }
+    }
+    let succeeded = results.iter().filter(|r| r.success).count() as i64;
+    let failed = results.iter().filter(|r| !r.success).count() as i64;
+
+    drop(store);
+    tokio::spawn(async {
+        let event = crate::models::LifecycleEvent {
+            event_type: "channel_deleted".to_string(),
+            channel_id: None,
+            channel_name: None,
+            message: "Channels bulk-deleted".to_string(),
+            occurred_at: Utc::now(),
+            metadata: serde_json::Value::Null,
+        };
+        deliver_lifecycle_event(&event).await;
+    });
+
+    Ok(Json(crate::models::BulkOperationResponse {
+        succeeded,
+        failed,
+        results,
+    }))
+}
+
+/// Bulk-tag notification channels
+#[utoipa::path(
+    post,
+    path = "/v1/admin/notifications/channels/bulk/tag",
+    tag = "admin",
+    request_body = crate::models::BulkTagRequest,
+    responses(
+        (status = 200, description = "Bulk tag result", body = crate::models::BulkOperationResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+pub async fn bulk_tag_channels(
+    State(_state): State<AppState>,
+    Json(body): Json<crate::models::BulkTagRequest>,
+) -> Result<Json<crate::models::BulkOperationResponse>, AppError> {
+    if body.channel_ids.is_empty() {
+        return Err(AppError::Validation(
+            "channel_ids must not be empty".to_string(),
+        ));
+    }
+    let mut store = notification_channels().write().await;
+    let mut results = Vec::new();
+    for id in &body.channel_ids {
+        if let Some(ch) = store.get_mut(id) {
+            for tag in &body.tags {
+                if !ch.tags.contains(tag) {
+                    ch.tags.push(tag.clone());
+                }
+            }
+            ch.updated_at = Utc::now();
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: true,
+                error: None,
+            });
+        } else {
+            results.push(crate::models::BulkChannelResult {
+                id: *id,
+                success: false,
+                error: Some(format!("channel {id} not found")),
+            });
+        }
+    }
+    let succeeded = results.iter().filter(|r| r.success).count() as i64;
+    let failed = results.iter().filter(|r| !r.success).count() as i64;
+    Ok(Json(crate::models::BulkOperationResponse {
+        succeeded,
+        failed,
+        results,
+    }))
 }

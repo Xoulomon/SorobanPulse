@@ -401,7 +401,41 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // #511: Notification channel bulk operations
+        .route(
+            "/admin/notifications/channels/bulk/enable",
+            axum::routing::post(handlers::bulk_enable_channels),
+        )
+        .route(
+            "/admin/notifications/channels/bulk/disable",
+            axum::routing::post(handlers::bulk_disable_channels),
+        )
+        .route(
+            "/admin/notifications/channels/bulk",
+            axum::routing::delete(handlers::bulk_delete_channels),
+        )
+        .route(
+            "/admin/notifications/channels/bulk/tag",
+            axum::routing::post(handlers::bulk_tag_channels),
+        )
+        // #512: System lifecycle webhooks
+        .route(
+            "/admin/notifications/system-webhooks",
+            axum::routing::post(handlers::create_system_webhook)
+                .get(handlers::list_system_webhooks),
+        )
+        // #513: Notification delivery SLA monitoring
+        .route(
+            "/admin/notifications/delivery",
+            axum::routing::post(handlers::record_notification_delivery)
+                .get(handlers::list_notification_deliveries),
+        )
+        // #514: Notification capacity planning
+        .route(
+            "/admin/notifications/capacity",
+            get(handlers::get_notification_capacity),
+        );
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

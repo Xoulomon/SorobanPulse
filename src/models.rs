@@ -835,6 +835,121 @@ pub struct PaginatedResponse<T> {
     pub has_more: bool,
 }
 
+// ── #511: Notification channel bulk operations ────────────────────────────────
+
+/// A managed notification channel (in-memory store).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NotificationChannel {
+    pub id: Uuid,
+    pub name: String,
+    pub channel_type: String,
+    pub active: bool,
+    pub tags: Vec<String>,
+    /// #513: optional delivery SLA in seconds
+    pub delivery_sla_seconds: Option<u64>,
+    pub config: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BulkChannelRequest {
+    pub channel_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BulkTagRequest {
+    pub channel_ids: Vec<Uuid>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BulkChannelResult {
+    pub id: Uuid,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BulkOperationResponse {
+    pub succeeded: i64,
+    pub failed: i64,
+    pub results: Vec<BulkChannelResult>,
+}
+
+// ── #512: Notification system lifecycle webhooks ──────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SystemWebhookConfig {
+    pub id: Uuid,
+    pub url: String,
+    pub secret: Option<String>,
+    /// Lifecycle event types this webhook subscribes to.
+    /// Supported: channel_created, channel_deleted, channel_failed,
+    ///            delivery_failed, queue_backed_up, or "*" for all.
+    pub events: Vec<String>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateSystemWebhookRequest {
+    pub url: String,
+    pub secret: Option<String>,
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LifecycleEvent {
+    pub event_type: String,
+    pub channel_id: Option<Uuid>,
+    pub channel_name: Option<String>,
+    pub message: String,
+    pub occurred_at: DateTime<Utc>,
+    pub metadata: Value,
+}
+
+// ── #513: Notification delivery SLA monitoring ────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NotificationDelivery {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub channel_name: String,
+    pub event_indexed_at: DateTime<Utc>,
+    pub delivered_at: DateTime<Utc>,
+    pub latency_seconds: f64,
+    pub sla_breached: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct RecordDeliveryRequest {
+    pub channel_id: Uuid,
+    pub channel_name: String,
+    pub event_indexed_at: DateTime<Utc>,
+    pub delivered_at: DateTime<Utc>,
+}
+
+// ── #514: Notification capacity planning ─────────────────────────────────────
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct NotificationCapacityResponse {
+    pub current_rate_per_minute: f64,
+    pub projected_rate_per_minute: f64,
+    pub growth_trend_percent: f64,
+    pub channels: Vec<ChannelCapacityInfo>,
+    pub computed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ChannelCapacityInfo {
+    pub channel_id: Uuid,
+    pub channel_name: String,
+    pub current_rate_per_minute: f64,
+    pub estimated_time_to_limit_minutes: Option<f64>,
+    pub recommendations: Vec<String>,
+}
+
 impl<T> PaginatedResponse<T> {
     pub fn new(data: Vec<T>, page: i64, limit: i64, total: i64) -> Self {
         let has_more = (page * limit) < total;

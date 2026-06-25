@@ -341,6 +341,24 @@ pub fn spawn_memory_collector() {
     });
 }
 
+/// #513: Record notification delivery latency per channel
+pub fn record_notification_delivery_latency(channel: &str, latency_seconds: f64) {
+    m::histogram!(
+        "soroban_pulse_notification_delivery_latency_seconds",
+        "channel" => channel.to_string()
+    )
+    .record(latency_seconds);
+}
+
+/// #514: Update notification rate per minute gauge per channel
+pub fn update_notification_rate_per_minute(channel: &str, rate: f64) {
+    m::gauge!(
+        "soroban_pulse_notification_rate_per_minute",
+        "channel" => channel.to_string()
+    )
+    .set(rate);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
