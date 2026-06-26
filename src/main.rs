@@ -23,6 +23,7 @@ mod metrics;
 mod middleware;
 mod models;
 mod normalizer;
+mod notification_dedup;
 
 #[cfg(feature = "parquet")]
 mod parquet_export;
@@ -37,8 +38,15 @@ mod schema_validator;
 mod stats_refresh;
 mod subscriptions;
 mod webhook;
+mod notification_rate_limit;
 mod notification_formatter;
 mod pagerduty;
+mod retry_policy;
+mod sms;
+mod aggregation;
+mod saved_queries;
+mod abi;
+mod oncall;
 mod xdr_validation;
 
 #[cfg(feature = "archive")]
@@ -196,9 +204,15 @@ async fn main() -> anyhow::Result<()> {
         let webhook_url = webhook_url.clone();
         let webhook_secret = config.webhook_secret.clone();
         let webhook_contract_filter = config.webhook_contract_filter.clone();
-        // Optional content filter (Issue #477): only deliver events whose data
-        // satisfies the predicate.
-        let webhook_content_filter = config.webhook_content_filter.clone();
+        let webhook_retry_policy = config.webhook_retry_policy.clone();
+        let webhook_pool = pool.clone();
+        // Per-channel rate limiter (Issue #476). `None` when no limit configured.
+        let webhook_rate_limiter = notification_rate_limit::ChannelRateLimiter::from_config(
+            &notification_rate_limit::RateLimitConfig::new(
+                config.webhook_rate_limit_per_minute,
+                config.webhook_rate_limit_per_hour,
+            ),
+        );
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -206,7 +220,8 @@ async fn main() -> anyhow::Result<()> {
 
         info!(
             url = %webhook_url,
-            content_filter = ?webhook_content_filter,
+            rate_limit_per_minute = ?config.webhook_rate_limit_per_minute,
+            rate_limit_per_hour = ?config.webhook_rate_limit_per_hour,
             "Webhook delivery enabled"
         );
 
@@ -231,13 +246,21 @@ async fn main() -> anyhow::Result<()> {
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
                         let pool_ref = Some(pool.as_ref());
+                        let priority = webhook::evaluate_priority(
+                            &event,
+                            config.notification_priority_rule_path.as_deref(),
+                            config.notification_priority_rule_value.as_deref(),
+                            config.notification_priority_rule_priority.as_deref(),
+                            &config.notification_default_priority,
+                        ).to_string();
                         tokio::spawn(webhook::deliver_with_retry_policy(
-                            client, 
-                            url, 
-                            secret, 
-                            event, 
+                            client,
+                            url,
+                            secret,
+                            event,
                             pool_ref,
-                            &config.webhook_retry_policy
+                            &config.webhook_retry_policy,
+                            priority,
                         ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -257,6 +280,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref from) = config.email_from {
             if !config.email_to.is_empty() {
                 let email_rx = event_tx.subscribe();
+                // Base URL for unsubscribe links (Issue #483): honor the
+                // configured public URL, otherwise fall back to localhost:<port>.
+                let base_url = config
+                    .email_public_base_url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{}", config.port));
                 let notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
@@ -266,14 +295,34 @@ async fn main() -> anyhow::Result<()> {
                     config.email_to.clone(),
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
+                    email::Schedule::parse(
+                        &config.email_schedule,
+                        config.email_daily_digest_hour,
+                        config.email_cron.clone(),
+                    ),
+                    email::QuietHours::parse(
+                        config.email_quiet_hours_start.as_deref(),
+                        config.email_quiet_hours_end.as_deref(),
+                    ),
+                    config.email_language.clone(),
                     pool.clone(),
+                    base_url,
                 );
 
                 info!(
                     smtp_host = %smtp_host,
                     recipients = config.email_to.len(),
+                    schedule = %config.email_schedule,
+                    language = %config.email_language,
                     "Email notifications enabled"
                 );
+
+                // SPF deliverability check (Issue #486): warn at startup if the
+                // sending domain has no SPF record. Best-effort and non-blocking.
+                let spf_from = from.clone();
+                tokio::spawn(async move {
+                    email::verify_spf_record(&spf_from).await;
+                });
 
                 notifier.spawn(email_rx);
             } else {

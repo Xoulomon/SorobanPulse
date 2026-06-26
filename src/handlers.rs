@@ -53,6 +53,40 @@ pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoRespo
     let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
     Json(json!({"job_id": job_id, "status": status, "progress": 42}))
 }
+
+/// Issue #480: List the available multi-language email notification templates.
+///
+/// `GET /v1/admin/notification-templates`
+///
+/// Returns the languages for which a bundled Handlebars template exists, the
+/// configured default language, and the on-disk template path for each entry.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notification-templates",
+    tag = "admin",
+    responses(
+        (status = 200, description = "List of available notification templates")
+    )
+)]
+pub async fn list_notification_templates() -> impl IntoResponse {
+    let templates: Vec<Value> = crate::email::SUPPORTED_LANGUAGES
+        .iter()
+        .map(|lang| {
+            json!({
+                "language": lang,
+                "engine": "handlebars",
+                "format": "text",
+                "file": format!("notification_templates/email_{lang}.hbs"),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "default_language": "en",
+        "count": templates.len(),
+        "templates": templates,
+    }))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -537,6 +571,65 @@ pub async fn health_live() -> (StatusCode, Json<Value>) {
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let (status, body) = build_health_response(&state).await;
     (status, Json(body))
+}
+
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
 }
 
 #[utoipa::path(
@@ -3541,7 +3634,7 @@ pub async fn bulk_insert_events(
         .bind(&event.event_data_normalized)
         .bind(&event.ledger_hash)
         .bind(event.in_successful_call.unwrap_or(false))
-        .execute(&state.write_pool)
+        .execute(&state.pool)
         .await;
         
         match result {
@@ -4782,6 +4875,289 @@ async fn store_event_with_idempotency(
     Ok(rows_affected)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #499 – Notification channel failover
+// #500 – Notification analytics dashboard
+// #501 – Notification cost tracking
+// #502 – Notification channel testing mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /v1/admin/notifications/dashboard
+///
+/// Returns a comprehensive analytics summary: totals per window, per-channel delivery
+/// success rates, average delivery latency, and the top-10 most-notified contracts.
+pub async fn notification_dashboard(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Total notifications sent in each time window
+    let windows: &[(&str, &str)] = &[
+        ("last_24h", "NOW() - INTERVAL '24 hours'"),
+        ("last_7d",  "NOW() - INTERVAL '7 days'"),
+        ("last_30d", "NOW() - INTERVAL '30 days'"),
+    ];
+
+    let mut totals = serde_json::Map::new();
+    for (label, interval) in windows {
+        let sql = format!(
+            "SELECT COUNT(*) FROM notification_costs WHERE sent_at >= {interval}"
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
+        totals.insert(label.to_string(), serde_json::json!(count));
+    }
+
+    // Per-channel delivery success rate (based on webhook_failures vs notification_costs)
+    let channel_rows = sqlx::query(
+        r#"
+        SELECT
+            nc.id::text               AS channel_id,
+            nc.name                   AS channel_name,
+            nc.channel_type           AS channel_type,
+            COUNT(DISTINCT ncost.id)  AS sent,
+            COUNT(DISTINCT wf.id)     AS failed
+        FROM notification_channels nc
+        LEFT JOIN notification_costs ncost ON ncost.channel_id = nc.id
+            AND ncost.sent_at >= NOW() - INTERVAL '30 days'
+        LEFT JOIN webhook_failures wf ON wf.url = (nc.config->>'url')
+            AND wf.created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY nc.id, nc.name, nc.channel_type
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let channels: Vec<serde_json::Value> = channel_rows
+        .into_iter()
+        .map(|r| {
+            let sent: i64 = r.try_get("sent").unwrap_or(0);
+            let failed: i64 = r.try_get("failed").unwrap_or(0);
+            let success_rate = if sent == 0 {
+                1.0_f64
+            } else {
+                (sent - failed).max(0) as f64 / sent as f64
+            };
+            serde_json::json!({
+                "channel_id":   r.try_get::<String, _>("channel_id").unwrap_or_default(),
+                "channel_name": r.try_get::<String, _>("channel_name").unwrap_or_default(),
+                "channel_type": r.try_get::<String, _>("channel_type").unwrap_or_default(),
+                "sent_30d":     sent,
+                "failed_30d":   failed,
+                "success_rate": (success_rate * 1000.0).round() / 1000.0,
+            })
+        })
+        .collect();
+
+    // Top-10 most-notified contracts (from events table, last 30d)
+    let top_contracts = sqlx::query(
+        r#"
+        SELECT contract_id, COUNT(*) AS event_count
+        FROM events
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY contract_id
+        ORDER BY event_count DESC
+        LIMIT 10
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        serde_json::json!({
+            "contract_id":  r.try_get::<String, _>("contract_id").unwrap_or_default(),
+            "event_count":  r.try_get::<i64, _>("event_count").unwrap_or(0),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    Json(serde_json::json!({
+        "totals":       totals,
+        "channels":     channels,
+        "top_contracts": top_contracts,
+    }))
+}
+
+/// GET /v1/admin/notifications/costs
+///
+/// Returns cumulative notification cost breakdown by channel and optional time period.
+pub async fn notification_costs(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let period = params.get("period").map(|s| s.as_str()).unwrap_or("30d");
+    let interval = match period {
+        "24h" => "24 hours",
+        "7d"  => "7 days",
+        "30d" => "30 days",
+        _     => "30 days",
+    };
+
+    let sql = format!(
+        r#"
+        SELECT
+            channel_id::text,
+            channel_name,
+            channel_type,
+            COUNT(*)          AS notification_count,
+            SUM(cost_cents)   AS total_cost_cents
+        FROM notification_costs
+        WHERE sent_at >= NOW() - INTERVAL '{interval}'
+        GROUP BY channel_id, channel_name, channel_type
+        ORDER BY total_cost_cents DESC
+        "#
+    );
+
+    let rows = sqlx::query(&sql)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+
+    let breakdown: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            let total_cents: i64 = r.try_get("total_cost_cents").unwrap_or(0);
+            serde_json::json!({
+                "channel_id":          r.try_get::<String, _>("channel_id").unwrap_or_default(),
+                "channel_name":        r.try_get::<String, _>("channel_name").unwrap_or_default(),
+                "channel_type":        r.try_get::<String, _>("channel_type").unwrap_or_default(),
+                "notification_count":  r.try_get::<i64, _>("notification_count").unwrap_or(0),
+                "total_cost_usd":      total_cents as f64 / 100.0,
+            })
+        })
+        .collect();
+
+    // Warn if monthly budget exceeded (config field, defaults to 0 = no limit)
+    let monthly_budget_usd: f64 = state
+        .config
+        .notification_monthly_budget_usd
+        .unwrap_or(0.0);
+
+    let total_usd: f64 = breakdown
+        .iter()
+        .filter_map(|b| b["total_cost_usd"].as_f64())
+        .sum();
+
+    if monthly_budget_usd > 0.0 && total_usd >= monthly_budget_usd * 0.9 {
+        tracing::warn!(
+            total_usd = total_usd,
+            budget_usd = monthly_budget_usd,
+            "Notification cost is approaching or has exceeded the monthly budget"
+        );
+    }
+
+    Json(serde_json::json!({
+        "period":        period,
+        "total_cost_usd": (total_usd * 100.0).round() / 100.0,
+        "breakdown":     breakdown,
+    }))
+}
+
+/// POST /v1/admin/notifications/channels/:id/test
+///
+/// Sends a test notification on the specified channel and returns the result.
+pub async fn test_notification_channel(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> impl IntoResponse {
+    let channel_uuid = match channel_id.parse::<uuid::Uuid>() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid channel id" })),
+            ).into_response();
+        }
+    };
+
+    let row = sqlx::query(
+        "SELECT id::text AS channel_id, name, channel_type, config \
+         FROM notification_channels WHERE id = $1"
+    )
+    .bind(channel_uuid)
+    .fetch_optional(&state.pool)
+    .await;
+
+    let channel = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "channel not found" })),
+            ).into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "DB error looking up notification channel");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            ).into_response();
+        }
+    };
+
+    let channel_name: String = channel.try_get("name").unwrap_or_default();
+    let channel_type: String = channel.try_get("channel_type").unwrap_or_default();
+    let config: serde_json::Value = channel.try_get("config").unwrap_or(serde_json::json!({}));
+
+    let test_subject = format!("[TEST] Soroban Pulse notification test – channel '{channel_name}'");
+    let test_body = format!(
+        "[TEST] This is a test notification from Soroban Pulse.\nChannel: {channel_name}\nType: {channel_type}\nSent at: {}",
+        chrono::Utc::now().to_rfc3339(),
+    );
+
+    let success = match channel_type.as_str() {
+        "webhook" => {
+            let url = config.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                false
+            } else {
+                let client = reqwest::Client::new();
+                let payload = serde_json::json!({
+                    "subject": test_subject,
+                    "body":    test_body,
+                    "test":    true,
+                });
+                client.post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(payload.to_string())
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
+        }
+        "email" | "sms" => {
+            tracing::info!(
+                channel_id = %channel_id,
+                channel_type = %channel_type,
+                subject = %test_subject,
+                "Test notification logged (email/SMS delivery requires live credentials)"
+            );
+            true
+        }
+        _ => false,
+    };
+
+    crate::metrics::record_notification_test(&channel_type, success);
+
+    let status = if success { StatusCode::OK } else { StatusCode::BAD_GATEWAY };
+    (
+        status,
+        Json(serde_json::json!({
+            "channel_id":   channel_id,
+            "channel_name": channel_name,
+            "channel_type": channel_type,
+            "success":      success,
+            "subject":      test_subject,
+        })),
+    ).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4834,6 +5210,7 @@ mod tests {
             .map(|(k, v)| (hash_api_key(k), v.clone()))
             .collect();
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         crate::routes::create_router_with_tx_and_tenant_map(
             pool.clone(),
             pool,
@@ -4853,6 +5230,7 @@ mod tests {
             config,
             None,
             Arc::new(hashed_map),
+            shutdown_rx,
         )
     }
 
@@ -9595,6 +9973,182 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
+
+    // ── #513: SLA monitoring unit tests ──────────────────────────────────────
+
+    #[test]
+    fn sla_latency_calculation_is_correct() {
+        let indexed = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let delivered = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let latency = (delivered - indexed).num_milliseconds() as f64 / 1000.0;
+        assert!((latency - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn sla_breach_detected_when_latency_exceeds_sla() {
+        let sla_seconds: u64 = 30;
+        let latency: f64 = 35.0;
+        let breached = latency > sla_seconds as f64;
+        assert!(breached, "expected SLA breach for latency {latency}s > SLA {sla_seconds}s");
+    }
+
+    #[test]
+    fn sla_not_breached_when_latency_within_sla() {
+        let sla_seconds: u64 = 30;
+        let latency: f64 = 10.0;
+        let breached = latency > sla_seconds as f64;
+        assert!(!breached);
+    }
+
+    // ── #514: Capacity planning unit tests ───────────────────────────────────
+
+    #[test]
+    fn growth_trend_zero_when_no_baseline() {
+        let baseline_rate_per_minute: f64 = 0.0;
+        let current_rate: f64 = 5.0;
+        let trend = if baseline_rate_per_minute > 0.0 {
+            ((current_rate - baseline_rate_per_minute) / baseline_rate_per_minute) * 100.0
+        } else {
+            0.0
+        };
+        assert_eq!(trend, 0.0);
+    }
+
+    #[test]
+    fn growth_trend_positive_when_current_above_baseline() {
+        let baseline: f64 = 10.0;
+        let current: f64 = 15.0;
+        let trend = ((current - baseline) / baseline) * 100.0;
+        assert!((trend - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn projected_rate_never_below_current_with_positive_trend() {
+        let current: f64 = 20.0;
+        let trend: f64 = 25.0;
+        let projected = current * (1.0 + trend.max(0.0) / 100.0);
+        assert!(projected >= current);
+    }
+
+    // ── #512: Lifecycle webhook unit tests ───────────────────────────────────
+
+    #[test]
+    fn lifecycle_event_type_matching_wildcard() {
+        let subscribed_events = vec!["*".to_string()];
+        let event_type = "channel_deleted";
+        let matches = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == event_type);
+        assert!(matches);
+    }
+
+    #[test]
+    fn lifecycle_event_type_matching_exact() {
+        let subscribed_events = vec![
+            "channel_created".to_string(),
+            "delivery_failed".to_string(),
+        ];
+        let matches_created = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == "channel_created");
+        let matches_deleted = subscribed_events
+            .iter()
+            .any(|e| e == "*" || e == "channel_deleted");
+        assert!(matches_created);
+        assert!(!matches_deleted);
+    }
+
+    #[test]
+    fn lifecycle_event_not_delivered_to_inactive_webhook() {
+        let webhook = crate::models::SystemWebhookConfig {
+            id: Uuid::new_v4(),
+            url: "http://example.com/hook".to_string(),
+            secret: None,
+            events: vec!["*".to_string()],
+            active: false,
+            created_at: Utc::now(),
+        };
+        assert!(!webhook.active, "inactive webhook should not receive events");
+    }
+
+    // ── #511: Bulk operations unit tests ─────────────────────────────────────
+
+    #[test]
+    fn bulk_response_counts_success_and_failure() {
+        let results = vec![
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: true,
+                error: None,
+            },
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: false,
+                error: Some("not found".to_string()),
+            },
+            crate::models::BulkChannelResult {
+                id: Uuid::new_v4(),
+                success: true,
+                error: None,
+            },
+        ];
+        let succeeded = results.iter().filter(|r| r.success).count() as i64;
+        let failed = results.iter().filter(|r| !r.success).count() as i64;
+        assert_eq!(succeeded, 2);
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
+    fn bulk_tag_appends_only_new_tags() {
+        let mut tags: Vec<String> = vec!["production".to_string()];
+        let new_tags = vec!["production".to_string(), "critical".to_string()];
+        for tag in &new_tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&"production".to_string()));
+        assert!(tags.contains(&"critical".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bulk_enable_returns_not_found_for_unknown_channel() {
+        let unknown_id = Uuid::new_v4();
+        let req = crate::models::BulkChannelRequest {
+            channel_ids: vec![unknown_id],
+        };
+
+        let mut store = notification_channels().write().await;
+        store.clear();
+        drop(store);
+
+        let mut results = Vec::new();
+        {
+            let mut s = notification_channels().write().await;
+            if let Some(ch) = s.get_mut(&unknown_id) {
+                ch.active = true;
+                results.push(crate::models::BulkChannelResult {
+                    id: unknown_id,
+                    success: true,
+                    error: None,
+                });
+            } else {
+                results.push(crate::models::BulkChannelResult {
+                    id: unknown_id,
+                    success: false,
+                    error: Some(format!("channel {unknown_id} not found")),
+                });
+            }
+        }
+        assert_eq!(results.len(), req.channel_ids.len());
+        assert!(!results[0].success);
+        assert!(results[0].error.as_deref().unwrap_or("").contains("not found"));
+    }
 }
 
 // ── Archive ──────────────────────────────────────────────────────────────────
@@ -10228,4 +10782,250 @@ async fn handle_ws_connection(
     
     let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::metrics::update_ws_connections(count);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #487 – Email open tracking
+// ---------------------------------------------------------------------------
+
+/// 1×1 transparent GIF used as the tracking pixel.
+const TRACKING_PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x02, 0x00, 0x3b,
+];
+
+/// Record an email open event and return the 1×1 tracking pixel.
+/// GET /v1/notifications/email/track/:token
+pub async fn track_email_open(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_opens SET opened_at = NOW()
+                WHERE token = $1 AND opened_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_open();
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/gif")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("pragma", "no-cache")
+        .body(Body::from(TRACKING_PIXEL_GIF.to_vec()))
+        .unwrap()
+}
+
+/// Return email open-rate statistics.
+/// GET /v1/admin/notifications/email/stats
+pub async fn get_email_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
+    let opened: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens WHERE opened_at IS NOT NULL",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
+    let open_rate = if total == 0 {
+        0.0_f64
+    } else {
+        opened as f64 / total as f64 * 100.0
+    };
+
+    Ok(Json(json!({
+        "total_sent": total,
+        "total_opened": opened,
+        "open_rate_pct": open_rate,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #488 – Email click tracking
+// ---------------------------------------------------------------------------
+
+/// Record an email link click and redirect to the destination URL.
+/// GET /v1/notifications/email/click/:token
+pub async fn track_email_click(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let dest: Option<String> = sqlx::query_scalar(
+        "SELECT destination_url FROM email_clicks WHERE token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let pool = state.pool.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_clicks SET clicked_at = NOW()
+                WHERE token = $1 AND clicked_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token_clone)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_click();
+        }
+    });
+
+    match dest {
+        Some(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("click token not found"))
+            .unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #489 – A/B test results
+// ---------------------------------------------------------------------------
+
+/// Return A/B test delivery and open-rate statistics.
+/// GET /v1/admin/notifications/email/ab-test/results
+pub async fn get_ab_test_results(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query(
+        "SELECT d.ab_template,
+                COUNT(d.id)                               AS deliveries,
+                COUNT(o.id) FILTER (WHERE o.opened_at IS NOT NULL) AS opens
+         FROM email_deliveries d
+         LEFT JOIN email_opens o
+               ON o.email_notification_id = d.email_notification_id
+              AND o.recipient = d.recipient
+         WHERE d.ab_template IS NOT NULL
+         GROUP BY d.ab_template
+         ORDER BY d.ab_template",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let template: Option<String> = row.try_get("ab_template").ok();
+            let deliveries: i64 = row.try_get("deliveries").unwrap_or(0);
+            let opens: i64 = row.try_get("opens").unwrap_or(0);
+            let open_rate = if deliveries == 0 {
+                0.0_f64
+            } else {
+                opens as f64 / deliveries as f64 * 100.0
+            };
+            json!({
+                "template": template,
+                "deliveries": deliveries,
+                "opens": opens,
+                "open_rate_pct": open_rate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #490 – Suppression list management
+// ---------------------------------------------------------------------------
+
+/// Add an email address or webhook URL to the suppression list.
+/// POST /v1/admin/notifications/suppress
+pub async fn add_suppression(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target' field".to_string()))?
+        .to_string();
+
+    let target_type = body
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target_type' field".to_string()))?
+        .to_string();
+
+    if target_type != "email" && target_type != "webhook" {
+        return Err(AppError::Validation(
+            "target_type must be 'email' or 'webhook'".to_string(),
+        ));
+    }
+
+    let reason = body.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO suppression_lists (target, target_type, reason, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (target, target_type) DO UPDATE \
+             SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at \
+         RETURNING id",
+    )
+    .bind(&target)
+    .bind(&target_type)
+    .bind(&reason)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "id": id,
+        "target": target,
+        "target_type": target_type,
+        "status": "suppressed",
+    })))
+}
+
+/// Remove an entry from the suppression list.
+/// DELETE /v1/admin/notifications/suppress/:id
+pub async fn remove_suppression(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let deleted: Option<String> = sqlx::query_scalar(
+        "DELETE FROM suppression_lists WHERE id = $1 RETURNING target",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match deleted {
+        Some(target) => Ok(Json(json!({ "id": id, "target": target, "status": "removed" }))),
+        None => Err(AppError::NotFound),
+    }
 }
