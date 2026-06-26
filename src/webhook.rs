@@ -87,9 +87,28 @@ pub async fn deliver_with_retry_policy(
     retry_policy: &crate::retry_policy::RetryPolicy,
     priority: String,
 ) {
-    // Build the payload including the priority field (#492).
-    let mut payload = match serde_json::to_value(&event) {
-        Ok(v) => v,
+    // Check suppression list before attempting delivery (Issue #490)
+    if let Some(pool) = pool {
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM suppression_lists \
+             WHERE target = $1 AND target_type = 'webhook' \
+             AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .bind(&url)
+        .fetch_one(pool)
+        .await
+        {
+            Ok(count) if count > 0 => {
+                info!(url = %url, "Webhook URL suppressed, skipping delivery");
+                crate::metrics::record_notification_suppressed();
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    let body = match serde_json::to_vec(&event) {
+        Ok(b) => b,
         Err(e) => {
             error!(error = %e, "Failed to serialize event for webhook delivery");
             return;

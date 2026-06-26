@@ -257,6 +257,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref from) = config.email_from {
             if !config.email_to.is_empty() {
                 let email_rx = event_tx.subscribe();
+                // Base URL for unsubscribe links (Issue #483): honor the
+                // configured public URL, otherwise fall back to localhost:<port>.
+                let base_url = config
+                    .email_public_base_url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{}", config.port));
                 let notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
@@ -266,21 +272,34 @@ async fn main() -> anyhow::Result<()> {
                     config.email_to.clone(),
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
+                    email::Schedule::parse(
+                        &config.email_schedule,
+                        config.email_daily_digest_hour,
+                        config.email_cron.clone(),
+                    ),
+                    email::QuietHours::parse(
+                        config.email_quiet_hours_start.as_deref(),
+                        config.email_quiet_hours_end.as_deref(),
+                    ),
+                    config.email_language.clone(),
                     pool.clone(),
-                )
-                .with_digest_config(
-                    config.email_max_contracts_in_digest,
-                    config.notification_default_priority.clone(),
-                    config.notification_priority_rule_path.clone(),
-                    config.notification_priority_rule_value.clone(),
-                    config.notification_priority_rule_priority.clone(),
+                    base_url,
                 );
 
                 info!(
                     smtp_host = %smtp_host,
                     recipients = config.email_to.len(),
+                    schedule = %config.email_schedule,
+                    language = %config.email_language,
                     "Email notifications enabled"
                 );
+
+                // SPF deliverability check (Issue #486): warn at startup if the
+                // sending domain has no SPF record. Best-effort and non-blocking.
+                let spf_from = from.clone();
+                tokio::spawn(async move {
+                    email::verify_spf_record(&spf_from).await;
+                });
 
                 notifier.spawn(email_rx);
             } else {
