@@ -403,7 +403,18 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/notifications/email/bounce", axum::routing::post(handlers::email_bounce_webhook))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // Issue #487: email open tracking (public – email clients fetch the pixel)
+        .route("/notifications/email/track/{token}", get(handlers::track_email_open))
+        // Issue #487: email open stats (admin)
+        .route("/admin/notifications/email/stats", get(handlers::get_email_stats))
+        // Issue #488: email click tracking (public – email link redirect)
+        .route("/notifications/email/click/{token}", get(handlers::track_email_click))
+        // Issue #489: A/B test results (admin)
+        .route("/admin/notifications/email/ab-test/results", get(handlers::get_ab_test_results))
+        // Issue #490: suppression list management (admin)
+        .route("/admin/notifications/suppress", axum::routing::post(handlers::add_suppression))
+        .route("/admin/notifications/suppress/{id}", axum::routing::delete(handlers::remove_suppression));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
