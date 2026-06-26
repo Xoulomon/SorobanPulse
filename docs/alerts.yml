@@ -150,3 +150,32 @@ groups:
           summary: "Materialized view refresh hit lock timeout"
           description: "A materialized view refresh was skipped due to a lock timeout in the last hour. Check for long-running queries blocking the view lock."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/db-pool-exhaustion.md"
+
+      # #513: Notification delivery SLA alerts
+      - alert: NotificationDeliverySLABreach
+        expr: |
+          histogram_quantile(0.95,
+            rate(soroban_pulse_notification_delivery_latency_seconds_bucket[5m])
+          ) > 30
+        for: 2m
+        labels:
+          severity: critical
+          component: notifications
+        annotations:
+          summary: "Notification delivery p95 latency exceeds 30s SLA"
+          description: "The p95 notification delivery latency for channel {{ $labels.channel }} is {{ $value | humanizeDuration }}, which exceeds the 30s SLA threshold. Check the notification pipeline for backlog or downstream failures."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md"
+
+      - alert: NotificationDeliveryLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(soroban_pulse_notification_delivery_latency_seconds_bucket[5m])
+          ) > 60
+        for: 5m
+        labels:
+          severity: warning
+          component: notifications
+        annotations:
+          summary: "Notification delivery p99 latency exceeds 60s"
+          description: "The p99 notification delivery latency for channel {{ $labels.channel }} is {{ $value | humanizeDuration }}. Investigate notification queue depth and downstream webhook/email endpoint health."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/notifications.md"
