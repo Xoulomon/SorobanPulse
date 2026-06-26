@@ -1,0 +1,8 @@
+Soroban Pulse は過去1分間に {{event_count}} 件の新しいイベントをインデックスしました。
+
+{{#each contracts}}コントラクト: {{contract_id}}
+  イベント数: {{event_count}}
+{{#each events}}  - 種類: {{event_type}}, レジャー: {{ledger}}, トランザクションハッシュ: {{tx_hash}}
+{{/each}}{{#if more_count}}  ... 他 {{more_count}} 件のイベント
+{{/if}}
+{{/each}}

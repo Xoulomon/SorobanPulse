@@ -5,9 +5,12 @@ The email notification feature allows operators to receive email alerts when spe
 ## Features
 
 - **Batched Notifications**: Events are batched and sent as a single email every minute to avoid flooding recipients
+- **Digest Grouped by Contract**: Each digest email groups events by contract ID with a per-contract summary (Issue #491)
+- **Priority Levels**: Critical events are delivered immediately; low-priority events stay in the digest (Issue #492)
 - **Contract Filtering**: Optional filtering to only receive notifications for specific contracts
 - **SMTP Support**: Works with any SMTP server (Gmail, SendGrid, AWS SES, etc.)
 - **Multiple Recipients**: Send notifications to multiple email addresses
+- **Unsubscribe Links**: Every email carries a per-recipient unsubscribe link and a `List-Unsubscribe` header (CAN-SPAM / GDPR). Opted-out recipients are skipped on subsequent sends.
 - **Secure**: SMTP credentials are never logged or exposed in metrics
 
 ## Configuration
@@ -26,8 +29,17 @@ Email notifications are configured via environment variables:
 - `EMAIL_SMTP_USER`: SMTP authentication username (required by most servers)
 - `EMAIL_SMTP_PASSWORD`: SMTP authentication password (required by most servers)
 - `EMAIL_CONTRACT_FILTER`: Comma-separated list of contract IDs to filter notifications
-- `EMAIL_MAX_EVENTS_IN_BODY`: When a digest exceeds this many events, the full list is attached as a file (default: `50`). See [Attachments](#attachments).
-- `EMAIL_ATTACHMENT_FORMAT`: Attachment format when one is generated — `csv` (default) or `json`
+- `EMAIL_PUBLIC_BASE_URL`: Public base URL used to build unsubscribe links (e.g. `https://pulse.example.com`). Defaults to `http://localhost:<PORT>` when unset.
+
+## Unsubscribing
+
+Each notification email includes an unsubscribe link of the form
+`<EMAIL_PUBLIC_BASE_URL>/unsubscribe?token=<token>` and a matching
+`List-Unsubscribe` header. The `/unsubscribe` endpoint is public (no API key
+required). Visiting it records the recipient's opt-out, and no further emails
+are sent to that address. The action is idempotent — re-visiting the link is
+safe. Set `EMAIL_PUBLIC_BASE_URL` to a publicly reachable URL so recipients can
+actually open the link.
 
 ## Example Configuration
 
@@ -109,30 +121,77 @@ Contract: CDEF456...
   - Type: system, Ledger: 1234573, TxHash: stu901...
 ```
 
-## Attachments
+## Notification Scheduling
 
-Issue #481: Large digests (for example a daily digest with hundreds of events) can produce an email body that exceeds client size limits, causing truncation or rejection. To avoid this, when the number of events in a batch exceeds `EMAIL_MAX_EVENTS_IN_BODY` (default `50`), Soroban Pulse attaches the **full** event list as a file and keeps only the per-contract summary in the body.
+Issue #479: By default, batched events are flushed roughly once a minute (`immediate`). To reduce alert fatigue, you can configure a digest schedule and/or quiet hours. All times are interpreted in **UTC**.
+
+### Schedules
+
+Set `EMAIL_SCHEDULE` to one of:
+
+| Value | Behavior |
+|-------|----------|
+| `immediate` (default) | Send batched events on every batch tick (~1 minute) |
+| `hourly_digest` | Send one digest per hour, containing all events from the past hour |
+| `daily_digest` | Send one digest per day at `EMAIL_DAILY_DIGEST_HOUR` (default 09:00 UTC) with all events from the past 24 hours |
+| `custom_cron` | Send according to the cron expression in `EMAIL_CRON` |
+
+```bash
+# Daily digest at 09:00 UTC
+EMAIL_SCHEDULE=daily_digest
+EMAIL_DAILY_DIGEST_HOUR=9
+```
+
+```bash
+# Custom cron: top of every hour (6-field syntax, seconds first)
+EMAIL_SCHEDULE=custom_cron
+EMAIL_CRON=0 0 * * * *
+```
+
+> Cron expressions use the [`cron`](https://docs.rs/cron) crate's 6/7-field syntax (`sec min hour day-of-month month day-of-week [year]`).
+
+### Quiet Hours
+
+Quiet hours suppress non-critical notifications during a UTC window. Events continue to accumulate and are delivered once the window closes, so nothing is lost — you are just not woken up at night.
+
+```bash
+# Suppress notifications between 22:00 and 07:00 UTC
+EMAIL_QUIET_HOURS_START=22:00
+EMAIL_QUIET_HOURS_END=07:00
+```
+
+The window may wrap past midnight (as above). The start time is inclusive and the end time is exclusive. Setting both bounds equal (or omitting either) disables quiet hours.
+## HTML Emails
+
+Issue #482: By default emails are sent as plain text. For non-technical stakeholders, Soroban Pulse can also render a formatted HTML email using a [Handlebars](https://handlebarsjs.com/) template.
 
 ### Configuration
 
+Set `EMAIL_FORMAT` to choose the body format:
+
+| Value | Behavior |
+|-------|----------|
+| `text` (default) | Plain-text body only |
+| `html` | HTML body only |
+| `both` | `multipart/alternative` message containing **both** plain-text and HTML parts; the recipient's client renders whichever it supports |
+
 ```bash
-# Attach a file once a digest has more than 100 events
-EMAIL_MAX_EVENTS_IN_BODY=100
-# Attach as CSV (default) or JSON
-EMAIL_ATTACHMENT_FORMAT=csv
+EMAIL_FORMAT=both
+EMAIL_API_BASE_URL=https://pulse.your-domain.com
 ```
 
-### Behavior
+### What the HTML email contains
 
-- When `event_count <= EMAIL_MAX_EVENTS_IN_BODY`: a plain-text summary email, no attachment (unchanged behavior).
-- When `event_count > EMAIL_MAX_EVENTS_IN_BODY`: a `multipart/mixed` email whose body contains the per-contract summary **plus a note** indicating the full list is attached, and an attached file with every event.
+- A summary table of events grouped by contract
+- **Color-coded event-type badges** (e.g. `contract`, `system`, `diagnostic` each get a distinct color)
+- Formatted timestamps (ledger close time)
+- **Clickable links**: each contract links to its event-history endpoint and each transaction hash links to its event lookup, built from `EMAIL_API_BASE_URL`
 
-### Attachment formats
+The HTML template lives at `notification_templates/email.html.hbs` and is embedded into the binary at compile time. All event values are HTML-escaped to prevent markup injection.
 
-| Format | Filename | MIME type | Contents |
-|--------|----------|-----------|----------|
-| `csv` (default) | `events.csv` | `text/csv` | Header row + one row per event: `contract_id,event_type,ledger,ledger_closed_at,tx_hash,in_successful_call` (RFC 4180 escaped) |
-| `json` | `events.json` | `application/json` | Pretty-printed JSON array of the full event objects |
+### Compatibility
+
+The template uses table-based layout and inline styles for broad compatibility with major email clients including Gmail, Outlook, and Apple Mail. When `EMAIL_FORMAT=both`, clients that cannot render HTML fall back to the plain-text part automatically.
 
 ## Batching Behavior
 
@@ -195,3 +254,77 @@ Monitor this metric to detect SMTP configuration issues or delivery failures.
 | Best for | Alerts, monitoring | Integrations, automation |
 
 Use email notifications for human-readable alerts and monitoring. Use webhooks for system integrations and real-time event processing.
+
+---
+
+## Digest Grouping by Contract (Issue #491)
+
+Email digests group events by `contract_id`, making it much easier to scan
+activity across many contracts at once.
+
+Each contract section in the digest shows:
+- **Contract ID** — full identifier
+- **Event count** — total events in this batch
+- **Type breakdown** — count per event type (e.g. `contract: 12, diagnostic: 3`)
+- **First / last timestamp** — ledger close times bounding this batch
+
+### Limiting Contracts per Digest
+
+When monitoring a large number of contracts, set `EMAIL_MAX_CONTRACTS_IN_DIGEST`
+to cap how many contracts appear in a single digest. Contracts are sorted by
+event count (most active first). A footer line reports how many additional
+contracts were omitted.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMAIL_MAX_CONTRACTS_IN_DIGEST` | `20` | Maximum contracts shown per digest email |
+
+**Example footer when limit is reached:**
+
+> … and 14 more contracts not shown. Set `EMAIL_MAX_CONTRACTS_IN_DIGEST` to a higher value to see all.
+
+---
+
+## Notification Priority Levels (Issue #492)
+
+Assign a priority level to notifications to control delivery urgency.
+
+| Priority | Email behaviour |
+|---|---|
+| `critical` | Sent **immediately**, bypassing the 1-minute batch window |
+| `high` | Included in the next batch digest |
+| `medium` | Included in the next batch digest (default) |
+| `low` | Included in the next batch digest |
+
+### Default Priority
+
+Set `NOTIFICATION_DEFAULT_PRIORITY` to the fallback priority when no rule matches.
+
+```bash
+NOTIFICATION_DEFAULT_PRIORITY=medium
+```
+
+### Dynamic Priority Rules (JSONPath)
+
+Use `NOTIFICATION_PRIORITY_RULE_PATH`, `NOTIFICATION_PRIORITY_RULE_VALUE`, and
+`NOTIFICATION_PRIORITY_RULE_PRIORITY` to assign a priority based on the event's
+`value` field:
+
+```bash
+# Mark any event whose event_data.action == "liquidate" as critical
+NOTIFICATION_PRIORITY_RULE_PATH=$.action
+NOTIFICATION_PRIORITY_RULE_VALUE=liquidate
+NOTIFICATION_PRIORITY_RULE_PRIORITY=critical
+```
+
+The rule uses a simple JSONPath expression (dot-separated keys, e.g. `$.a.b`).
+If the field at the path equals the expected value, the rule priority is applied;
+otherwise the default priority is used.
+
+### Priority in Email Subject
+
+The digest subject line includes the highest priority present in the batch:
+
+```
+[CRITICAL] Soroban Pulse: 42 events across 5 contracts
+```

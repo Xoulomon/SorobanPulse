@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{subject}}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7; font-family:Arial, Helvetica, sans-serif; color:#1a1a1a;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="640" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden; max-width:640px; width:100%;">
+          <tr>
+            <td style="background-color:#0f172a; padding:20px 28px;">
+              <span style="color:#ffffff; font-size:18px; font-weight:bold;">Soroban Pulse</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px;">
+              <p style="font-size:15px; margin:0 0 20px;">
+                Soroban Pulse indexed <strong>{{event_count}}</strong> new event(s) in the last minute.
+              </p>
+
+              {{#each contracts}}
+              <div style="margin-bottom:24px;">
+                <p style="font-size:14px; font-weight:bold; margin:0 0 8px;">
+                  Contract:
+                  <a href="{{contract_link}}" style="color:#2563eb; text-decoration:none;">{{contract_id}}</a>
+                  <span style="color:#64748b; font-weight:normal;">&nbsp;&middot;&nbsp;{{event_count}} event(s)</span>
+                </p>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13px;">
+                  <thead>
+                    <tr>
+                      <th align="left" style="border-bottom:2px solid #e2e8f0; padding:6px 8px;">Type</th>
+                      <th align="left" style="border-bottom:2px solid #e2e8f0; padding:6px 8px;">Ledger</th>
+                      <th align="left" style="border-bottom:2px solid #e2e8f0; padding:6px 8px;">Closed At</th>
+                      <th align="left" style="border-bottom:2px solid #e2e8f0; padding:6px 8px;">Tx Hash</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{#each events}}
+                    <tr>
+                      <td style="border-bottom:1px solid #f1f5f9; padding:6px 8px;">
+                        <span style="display:inline-block; padding:2px 8px; border-radius:4px; color:#ffffff; font-size:12px; background-color:{{color}};">{{event_type}}</span>
+                      </td>
+                      <td style="border-bottom:1px solid #f1f5f9; padding:6px 8px;">{{ledger}}</td>
+                      <td style="border-bottom:1px solid #f1f5f9; padding:6px 8px; color:#475569;">{{ledger_closed_at}}</td>
+                      <td style="border-bottom:1px solid #f1f5f9; padding:6px 8px;">
+                        <a href="{{tx_link}}" style="color:#2563eb; text-decoration:none;">{{tx_hash}}</a>
+                      </td>
+                    </tr>
+                    {{/each}}
+                  </tbody>
+                </table>
+                {{#if more_count}}
+                <p style="font-size:12px; color:#64748b; margin:8px 0 0;">&hellip; and {{more_count}} more event(s)</p>
+                {{/if}}
+              </div>
+              {{/each}}
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color:#f8fafc; padding:16px 28px; border-top:1px solid #e2e8f0;">
+              <p style="font-size:12px; color:#94a3b8; margin:0;">
+                You are receiving this because email notifications are enabled for Soroban Pulse.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
