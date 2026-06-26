@@ -43,6 +43,47 @@ impl FromStr for NotificationFormat {
     }
 }
 
+/// Notification priority levels (Issue #492).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationPriority {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl NotificationPriority {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "low" => Self::Low,
+            _ => Self::Medium,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    /// Returns true when the notification must be delivered immediately rather than batched.
+    pub fn is_immediate(self) -> bool {
+        matches!(self, Self::Critical)
+    }
+}
+
+impl std::fmt::Display for NotificationPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]

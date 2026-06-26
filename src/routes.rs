@@ -82,6 +82,7 @@ pub struct AppState {
         handlers::health,
         handlers::health_live,
         handlers::health_ready,
+        handlers::email_bounce_webhook,
         handlers::status,
         handlers::get_events,
         handlers::get_event_stats,
@@ -399,43 +400,21 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
         .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
+        .route("/notifications/email/bounce", axum::routing::post(handlers::email_bounce_webhook))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
         .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
-        // Notification channel import/export (#504) — static paths first
-        .route(
-            "/admin/notifications/channels/export",
-            get(handlers::export_notification_channels),
-        )
-        .route(
-            "/admin/notifications/channels/import",
-            axum::routing::post(handlers::import_notification_channels),
-        )
-        // Notification channel CRUD + clone (#506)
-        .route(
-            "/admin/notifications/channels",
-            get(handlers::list_notification_channels)
-                .post(handlers::create_notification_channel),
-        )
-        .route(
-            "/admin/notifications/channels/{id}",
-            get(handlers::get_notification_channel)
-                .put(handlers::update_notification_channel)
-                .delete(handlers::delete_notification_channel),
-        )
-        .route(
-            "/admin/notifications/channels/{id}/clone",
-            axum::routing::post(handlers::clone_notification_channel),
-        )
-        // Channel versioning (#505)
-        .route(
-            "/admin/notifications/channels/{id}/versions",
-            get(handlers::list_channel_versions),
-        )
-        .route(
-            "/admin/notifications/channels/{id}/rollback/{version}",
-            axum::routing::post(handlers::rollback_channel_version),
-        );
+        // Issue #487: email open tracking (public – email clients fetch the pixel)
+        .route("/notifications/email/track/{token}", get(handlers::track_email_open))
+        // Issue #487: email open stats (admin)
+        .route("/admin/notifications/email/stats", get(handlers::get_email_stats))
+        // Issue #488: email click tracking (public – email link redirect)
+        .route("/notifications/email/click/{token}", get(handlers::track_email_click))
+        // Issue #489: A/B test results (admin)
+        .route("/admin/notifications/email/ab-test/results", get(handlers::get_ab_test_results))
+        // Issue #490: suppression list management (admin)
+        .route("/admin/notifications/suppress", axum::routing::post(handlers::add_suppression))
+        .route("/admin/notifications/suppress/{id}", axum::routing::delete(handlers::remove_suppression));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
@@ -476,10 +455,13 @@ pub fn create_router_with_tx_and_tenant_map(
         ));
 
     // Health endpoints — exempt from rate limiting.
+    // The unsubscribe endpoint is public (reached from email links) and must
+    // bypass both auth and rate limiting (Issue #483).
     let health_routes = Router::new()
         .route("/health", get(handlers::health))
         .route("/healthz/live", get(handlers::health_live))
         .route("/healthz/ready", get(handlers::health_ready))
+        .route("/unsubscribe", get(handlers::unsubscribe))
         .route("/metrics", get(handlers::metrics));
 
     // All other routes — subject to rate limiting.

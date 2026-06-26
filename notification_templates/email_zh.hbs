@@ -1,0 +1,8 @@
+Soroban Pulse 在过去一分钟内索引了 {{event_count}} 个新事件。
+
+{{#each contracts}}合约：{{contract_id}}
+  事件数：{{event_count}}
+{{#each events}}  - 类型：{{event_type}}，账本：{{ledger}}，交易哈希：{{tx_hash}}
+{{/each}}{{#if more_count}}  ... 以及另外 {{more_count}} 个事件
+{{/if}}
+{{/each}}

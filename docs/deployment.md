@@ -777,3 +777,56 @@ Expected output on PostgreSQL 14+:
 ```
 
 (`x` = EXTENDED, `l` = lz4)
+
+---
+
+## Email Bounce Handling
+
+The email notification system suppresses addresses that have bounced (invalid
+mailbox, mailbox full, etc.). Continuing to send to bouncing addresses harms
+the sender's reputation and reduces deliverability for everyone, so bounced
+recipients are stored in the `email_bounces` table and skipped on future sends.
+
+### Bounce webhook endpoint
+
+Configure your email provider to POST bounce notifications to:
+
+```
+POST /v1/notifications/email/bounce
+```
+
+The endpoint accepts the native bounce payloads of the three common providers
+and extracts the bounced address(es) from each:
+
+- **SendGrid** — the [Event Webhook](https://docs.sendgrid.com/for-developers/tracking-events/getting-started-event-webhook)
+  posts a JSON array of events; `bounce`, `dropped` and `blocked` events are recorded.
+- **AWS SES** — bounce notifications delivered directly or via an SNS
+  subscription (the SNS `Message` envelope is unwrapped automatically).
+- **Mailgun** — both the modern `event-data` webhook and the legacy flat payload
+  (`failed` / `bounced` / `dropped` / `rejected`).
+
+The endpoint is under `/v1`, so it requires the standard `API_KEY` if one is
+configured. Most providers let you add a custom `Authorization` header (or an
+API key query parameter) to the webhook configuration — use that to authenticate.
+
+The response reports how many bounced addresses were received and recorded:
+
+```json
+{ "received": 1, "recorded": 1 }
+```
+
+### Monitoring
+
+Each recorded bounce increments the `soroban_pulse_email_bounces_total`
+Prometheus counter. A rising bounce rate is an early warning that the recipient
+list contains stale addresses or that the sending domain's reputation is
+degrading.
+
+### Clearing a bounce
+
+If an address was suppressed in error (e.g. a transient mailbox-full bounce),
+delete its row to resume delivery:
+
+```sql
+DELETE FROM email_bounces WHERE email = 'user@example.com';
+```

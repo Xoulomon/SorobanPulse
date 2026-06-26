@@ -53,6 +53,40 @@ pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoRespo
     let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
     Json(json!({"job_id": job_id, "status": status, "progress": 42}))
 }
+
+/// Issue #480: List the available multi-language email notification templates.
+///
+/// `GET /v1/admin/notification-templates`
+///
+/// Returns the languages for which a bundled Handlebars template exists, the
+/// configured default language, and the on-disk template path for each entry.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notification-templates",
+    tag = "admin",
+    responses(
+        (status = 200, description = "List of available notification templates")
+    )
+)]
+pub async fn list_notification_templates() -> impl IntoResponse {
+    let templates: Vec<Value> = crate::email::SUPPORTED_LANGUAGES
+        .iter()
+        .map(|lang| {
+            json!({
+                "language": lang,
+                "engine": "handlebars",
+                "format": "text",
+                "file": format!("notification_templates/email_{lang}.hbs"),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "default_language": "en",
+        "count": templates.len(),
+        "templates": templates,
+    }))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -537,6 +571,65 @@ pub async fn health_live() -> (StatusCode, Json<Value>) {
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let (status, body) = build_health_response(&state).await;
     (status, Json(body))
+}
+
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
 }
 
 #[utoipa::path(
@@ -10168,660 +10261,248 @@ async fn handle_ws_connection(
     crate::metrics::update_ws_connections(count);
 }
 
-// ── Notification Channels ─────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Issue #487 – Email open tracking
+// ---------------------------------------------------------------------------
 
-const VALID_CHANNEL_TYPES: &[&str] = &["webhook", "email", "sms"];
+/// 1×1 transparent GIF used as the tracking pixel.
+const TRACKING_PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x02, 0x00, 0x3b,
+];
 
-const DEFAULT_RETRY_POLICY: &str = r#"{
-    "max_attempts": 3,
-    "initial_backoff_ms": 1000,
-    "backoff_multiplier": 2.0,
-    "max_backoff_ms": 60000
-}"#;
-
-/// Validate a channel's config at creation or update time (#503).
-///
-/// - webhook: sends a HEAD request to `config.url` and expects 2xx.
-/// - email:   opens an SMTP connection using `config.smtp_host/port/user/password`.
-/// - sms:     no network check (credentials are opaque to the platform).
-async fn validate_channel_config(channel_type: &str, config: &Value) -> Result<(), AppError> {
-    match channel_type {
-        "webhook" => {
-            let url = config
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AppError::Validation("webhook config must include 'url'".to_string()))?;
-
-            crate::webhook::validate_webhook_url(url)
-                .await
-                .map_err(|e| AppError::Validation(format!("webhook validation failed: {}", e)))?;
+/// Record an email open event and return the 1×1 tracking pixel.
+/// GET /v1/notifications/email/track/:token
+pub async fn track_email_open(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_opens SET opened_at = NOW()
+                WHERE token = $1 AND opened_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_open();
         }
-        "email" => {
-            let smtp_host = config
-                .get("smtp_host")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AppError::Validation("email config must include 'smtp_host'".to_string())
-                })?
-                .to_string();
-
-            let smtp_port = config
-                .get("smtp_port")
-                .and_then(Value::as_u64)
-                .unwrap_or(587) as u16;
-
-            let smtp_user = config
-                .get("smtp_user")
-                .and_then(Value::as_str)
-                .map(String::from);
-
-            let smtp_password = config
-                .get("smtp_password")
-                .and_then(Value::as_str)
-                .map(String::from);
-
-            crate::email::validate_smtp_config(smtp_host, smtp_port, smtp_user, smtp_password)
-                .await
-                .map_err(|e| AppError::Validation(format!("email validation failed: {}", e)))?;
-        }
-        _ => {} // sms and future types: no upfront network check
-    }
-    Ok(())
-}
-
-pub async fn list_notification_channels(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
-    let channels = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
-         FROM notification_channels ORDER BY created_at DESC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    let total = channels.len();
-    Ok(Json(json!({ "data": channels, "total": total })))
-}
-
-pub async fn get_notification_channel(
-    Path(id): Path<Uuid>,
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
-         FROM notification_channels WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(json!(channel)))
-}
-
-pub async fn create_notification_channel(
-    State(state): State<AppState>,
-    Json(req): Json<models::CreateChannelRequest>,
-) -> Result<(StatusCode, Json<Value>), AppError> {
-    if !VALID_CHANNEL_TYPES.contains(&req.channel_type.as_str()) {
-        return Err(AppError::Validation(
-            "channel_type must be one of: webhook, email, sms".to_string(),
-        ));
-    }
-
-    // Validate channel config at creation time (#503).
-    validate_channel_config(&req.channel_type, &req.config).await?;
-
-    let retry_policy = req.retry_policy.unwrap_or_else(|| {
-        serde_json::from_str(DEFAULT_RETRY_POLICY).unwrap()
     });
 
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
-    )
-    .bind(&req.name)
-    .bind(&req.channel_type)
-    .bind(&req.config)
-    .bind(&retry_policy)
-    .fetch_one(&state.pool)
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(json!(channel))))
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/gif")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("pragma", "no-cache")
+        .body(Body::from(TRACKING_PIXEL_GIF.to_vec()))
+        .unwrap()
 }
 
-pub async fn update_notification_channel(
-    Path(id): Path<Uuid>,
-    State(state): State<AppState>,
-    Json(req): Json<models::UpdateChannelRequest>,
-) -> Result<Json<Value>, AppError> {
-    let existing = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
-         FROM notification_channels WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    // Record the current state as a version before applying changes (#505).
-    let next_version: i32 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(version_number), 0) + 1
-         FROM notification_channel_versions WHERE channel_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO notification_channel_versions
-             (channel_id, version_number, name, channel_type, config, retry_policy)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(id)
-    .bind(next_version)
-    .bind(&existing.name)
-    .bind(&existing.channel_type)
-    .bind(&existing.config)
-    .bind(&existing.retry_policy)
-    .execute(&state.pool)
-    .await?;
-
-    let new_name = req.name.unwrap_or(existing.name);
-    let new_config = req.config.unwrap_or(existing.config);
-    let new_retry = req.retry_policy.unwrap_or(existing.retry_policy);
-
-    // Validate updated config before persisting (#503).
-    validate_channel_config(&existing.channel_type, &new_config).await?;
-
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "UPDATE notification_channels
-         SET name = $2, config = $3, retry_policy = $4, updated_at = NOW()
-         WHERE id = $1
-         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
-    )
-    .bind(id)
-    .bind(&new_name)
-    .bind(&new_config)
-    .bind(&new_retry)
-    .fetch_one(&state.pool)
-    .await?;
-
-    Ok(Json(json!(channel)))
-}
-
-pub async fn delete_notification_channel(
-    Path(id): Path<Uuid>,
-    State(state): State<AppState>,
-) -> Result<StatusCode, AppError> {
-    let result = sqlx::query("DELETE FROM notification_channels WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound);
-    }
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// POST /v1/admin/notifications/channels/:id/clone
-///
-/// Creates a copy of the specified channel. The clone gets a " (copy)" name
-/// suffix unless an explicit name override is supplied in the request body.
-/// Any other fields in the body override the corresponding source values.
-pub async fn clone_notification_channel(
-    Path(id): Path<Uuid>,
-    State(state): State<AppState>,
-    body: Option<Json<models::CloneChannelRequest>>,
-) -> Result<(StatusCode, Json<Value>), AppError> {
-    let source = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
-         FROM notification_channels WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    let overrides = body.map(|b| b.0).unwrap_or_default();
-    let cloned_name = overrides
-        .name
-        .unwrap_or_else(|| format!("{} (copy)", source.name));
-    let cloned_config = overrides.config.unwrap_or(source.config);
-    let cloned_retry = overrides.retry_policy.unwrap_or(source.retry_policy);
-
-    let cloned = sqlx::query_as::<_, models::NotificationChannel>(
-        "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
-    )
-    .bind(&cloned_name)
-    .bind(&source.channel_type)
-    .bind(&cloned_config)
-    .bind(&cloned_retry)
-    .fetch_one(&state.pool)
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(json!(cloned))))
-}
-
-#[cfg(test)]
-mod notification_channel_clone_tests {
-    use super::*;
-
-    #[test]
-    fn clone_name_gets_copy_suffix_when_no_override() {
-        let source_name = "Production Alerts";
-        let override_name: Option<String> = None;
-        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
-        assert_eq!(cloned, "Production Alerts (copy)");
-    }
-
-    #[test]
-    fn clone_name_uses_override_when_provided() {
-        let source_name = "Production Alerts";
-        let override_name = Some("Staging Alerts".to_string());
-        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
-        assert_eq!(cloned, "Staging Alerts");
-    }
-
-    #[test]
-    fn clone_name_nested_copy_suffix() {
-        let source_name = "My Webhook (copy)";
-        let override_name: Option<String> = None;
-        let cloned = override_name.unwrap_or_else(|| format!("{} (copy)", source_name));
-        assert_eq!(cloned, "My Webhook (copy) (copy)");
-    }
-
-    #[test]
-    fn valid_channel_types_accepted() {
-        for t in VALID_CHANNEL_TYPES {
-            assert!(VALID_CHANNEL_TYPES.contains(t));
-        }
-    }
-
-    #[test]
-    fn invalid_channel_type_rejected() {
-        assert!(!VALID_CHANNEL_TYPES.contains(&"slack"));
-        assert!(!VALID_CHANNEL_TYPES.contains(&"push"));
-    }
-}
-
-// ── Notification Channel Versioning (#505) ────────────────────────────────────
-
-/// GET /v1/admin/notifications/channels/:id/versions
-///
-/// Returns the full configuration history for the channel, newest first.
-pub async fn list_channel_versions(
-    Path(id): Path<Uuid>,
+/// Return email open-rate statistics.
+/// GET /v1/admin/notifications/email/stats
+pub async fn get_email_stats(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // Verify the channel exists first.
-    let exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM notification_channels WHERE id = $1",
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens",
     )
-    .bind(id)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
-    if exists == 0 {
-        return Err(AppError::NotFound);
-    }
-
-    let rows = sqlx::query(
-        "SELECT id, channel_id, version_number, name, channel_type, config, retry_policy, created_at
-         FROM notification_channel_versions
-         WHERE channel_id = $1
-         ORDER BY version_number DESC",
+    let opened: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens WHERE opened_at IS NOT NULL",
     )
-    .bind(id)
-    .fetch_all(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
-    let versions: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "id":             r.get::<Uuid, _>("id"),
-                "channel_id":     r.get::<Uuid, _>("channel_id"),
-                "version_number": r.get::<i32, _>("version_number"),
-                "name":           r.get::<String, _>("name"),
-                "channel_type":   r.get::<String, _>("channel_type"),
-                "config":         r.get::<Value, _>("config"),
-                "retry_policy":   r.get::<Value, _>("retry_policy"),
-                "created_at":     r.get::<DateTime<Utc>, _>("created_at"),
-            })
-        })
-        .collect();
-
-    let total = versions.len();
-    Ok(Json(json!({ "data": versions, "total": total })))
-}
-
-/// POST /v1/admin/notifications/channels/:id/rollback/:version
-///
-/// Restores the channel to the configuration recorded in the specified version.
-pub async fn rollback_channel_version(
-    Path((id, version)): Path<(Uuid, i32)>,
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
-    let row = sqlx::query(
-        "SELECT name, config, retry_policy
-         FROM notification_channel_versions
-         WHERE channel_id = $1 AND version_number = $2",
-    )
-    .bind(id)
-    .bind(version)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    let name: String = row.get("name");
-    let config: Value = row.get("config");
-    let retry_policy: Value = row.get("retry_policy");
-
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "UPDATE notification_channels
-         SET name = $2, config = $3, retry_policy = $4, updated_at = NOW()
-         WHERE id = $1
-         RETURNING id, name, channel_type, config, retry_policy, created_at, updated_at",
-    )
-    .bind(id)
-    .bind(&name)
-    .bind(&config)
-    .bind(&retry_policy)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(json!(channel)))
-}
-
-#[cfg(test)]
-mod notification_channel_versioning_tests {
-    use super::*;
-
-    #[test]
-    fn next_version_number_is_one_when_no_history() {
-        // Simulates: COALESCE(MAX(version_number), 0) + 1
-        let max_existing: i32 = 0;
-        let next = max_existing + 1;
-        assert_eq!(next, 1);
-    }
-
-    #[test]
-    fn next_version_number_increments_from_existing() {
-        let max_existing: i32 = 5;
-        let next = max_existing + 1;
-        assert_eq!(next, 6);
-    }
-
-    #[test]
-    fn rollback_applies_archived_config() {
-        let archived_name = "Old Name";
-        let current_name = "New Name";
-        // After rollback, channel name should match the archived version.
-        let rolled_back = archived_name;
-        assert_ne!(rolled_back, current_name);
-        assert_eq!(rolled_back, "Old Name");
-    }
-}
-
-// ── Notification Channel Import / Export (#504) ───────────────────────────────
-
-/// Recursively replace values whose key matches a known secret field name with
-/// the placeholder string so that exported configs are safe to share.
-fn redact_secrets(value: Value) -> Value {
-    const SECRET_KEYS: &[&str] = &[
-        "secret", "password", "api_key", "token", "credential", "auth",
-    ];
-    match value {
-        Value::Object(mut map) => {
-            for (k, v) in map.iter_mut() {
-                let k_lower = k.to_lowercase();
-                if SECRET_KEYS.iter().any(|s| k_lower.contains(s)) {
-                    *v = Value::String("***REDACTED***".to_string());
-                } else {
-                    *v = redact_secrets(v.clone());
-                }
-            }
-            Value::Object(map)
-        }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(redact_secrets).collect()),
-        other => other,
-    }
-}
-
-/// GET /v1/admin/notifications/channels/export?format=json|yaml
-///
-/// Returns all channel configurations. Secret-looking fields are redacted.
-pub async fn export_notification_channels(
-    Query(params): Query<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
-    let channels = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
-         FROM notification_channels ORDER BY created_at ASC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    let redacted: Vec<Value> = channels
-        .into_iter()
-        .map(|ch| {
-            json!({
-                "name":         ch.name,
-                "channel_type": ch.channel_type,
-                "config":       redact_secrets(ch.config),
-                "retry_policy": ch.retry_policy,
-            })
-        })
-        .collect();
-
-    let payload = json!({ "channels": redacted });
-
-    let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
-
-    match format {
-        "yaml" => {
-            let yaml_str = serde_yaml::to_string(&payload)
-                .map_err(|e| AppError::Internal(format!("YAML serialization failed: {}", e)))?;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/x-yaml")
-                .body(Body::from(yaml_str))
-                .unwrap()
-                .into_response())
-        }
-        _ => Ok((StatusCode::OK, Json(payload)).into_response()),
-    }
-}
-
-/// POST /v1/admin/notifications/channels/import
-///
-/// Accepts a JSON or YAML body containing a `channels` array and creates each
-/// channel. Secrets must be supplied by the caller (they are redacted on export).
-pub async fn import_notification_channels(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-    headers: HeaderMap,
-) -> Result<(StatusCode, Json<Value>), AppError> {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json");
-
-    let req: models::ImportChannelsRequest = if content_type.contains("yaml") {
-        serde_yaml::from_slice(&body)
-            .map_err(|e| AppError::Validation(format!("invalid YAML: {}", e)))?
+    let open_rate = if total == 0 {
+        0.0_f64
     } else {
-        serde_json::from_slice(&body)
-            .map_err(|e| AppError::Validation(format!("invalid JSON: {}", e)))?
+        opened as f64 / total as f64 * 100.0
     };
 
-    if req.channels.is_empty() {
+    Ok(Json(json!({
+        "total_sent": total,
+        "total_opened": opened,
+        "open_rate_pct": open_rate,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #488 – Email click tracking
+// ---------------------------------------------------------------------------
+
+/// Record an email link click and redirect to the destination URL.
+/// GET /v1/notifications/email/click/:token
+pub async fn track_email_click(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let dest: Option<String> = sqlx::query_scalar(
+        "SELECT destination_url FROM email_clicks WHERE token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let pool = state.pool.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_clicks SET clicked_at = NOW()
+                WHERE token = $1 AND clicked_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token_clone)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_click();
+        }
+    });
+
+    match dest {
+        Some(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("click token not found"))
+            .unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #489 – A/B test results
+// ---------------------------------------------------------------------------
+
+/// Return A/B test delivery and open-rate statistics.
+/// GET /v1/admin/notifications/email/ab-test/results
+pub async fn get_ab_test_results(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query(
+        "SELECT d.ab_template,
+                COUNT(d.id)                               AS deliveries,
+                COUNT(o.id) FILTER (WHERE o.opened_at IS NOT NULL) AS opens
+         FROM email_deliveries d
+         LEFT JOIN email_opens o
+               ON o.email_notification_id = d.email_notification_id
+              AND o.recipient = d.recipient
+         WHERE d.ab_template IS NOT NULL
+         GROUP BY d.ab_template
+         ORDER BY d.ab_template",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let template: Option<String> = row.try_get("ab_template").ok();
+            let deliveries: i64 = row.try_get("deliveries").unwrap_or(0);
+            let opens: i64 = row.try_get("opens").unwrap_or(0);
+            let open_rate = if deliveries == 0 {
+                0.0_f64
+            } else {
+                opens as f64 / deliveries as f64 * 100.0
+            };
+            json!({
+                "template": template,
+                "deliveries": deliveries,
+                "opens": opens,
+                "open_rate_pct": open_rate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #490 – Suppression list management
+// ---------------------------------------------------------------------------
+
+/// Add an email address or webhook URL to the suppression list.
+/// POST /v1/admin/notifications/suppress
+pub async fn add_suppression(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target' field".to_string()))?
+        .to_string();
+
+    let target_type = body
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target_type' field".to_string()))?
+        .to_string();
+
+    if target_type != "email" && target_type != "webhook" {
         return Err(AppError::Validation(
-            "channels array must not be empty".to_string(),
+            "target_type must be 'email' or 'webhook'".to_string(),
         ));
     }
 
-    let default_retry: Value = serde_json::from_str(DEFAULT_RETRY_POLICY).unwrap();
+    let reason = body.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
 
-    let mut created = 0u32;
-    let mut errors: Vec<String> = Vec::new();
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO suppression_lists (target, target_type, reason, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (target, target_type) DO UPDATE \
+             SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at \
+         RETURNING id",
+    )
+    .bind(&target)
+    .bind(&target_type)
+    .bind(&reason)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
 
-    for entry in req.channels {
-        if !VALID_CHANNEL_TYPES.contains(&entry.channel_type.as_str()) {
-            errors.push(format!(
-                "channel '{}': invalid channel_type '{}'",
-                entry.name, entry.channel_type
-            ));
-            continue;
-        }
-
-        let retry = entry.retry_policy.unwrap_or_else(|| default_retry.clone());
-
-        match sqlx::query(
-            "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (name) DO NOTHING",
-        )
-        .bind(&entry.name)
-        .bind(&entry.channel_type)
-        .bind(&entry.config)
-        .bind(&retry)
-        .execute(&state.pool)
-        .await
-        {
-            Ok(r) if r.rows_affected() > 0 => created += 1,
-            Ok(_) => errors.push(format!("channel '{}': name already exists, skipped", entry.name)),
-            Err(e) => errors.push(format!("channel '{}': {}", entry.name, e)),
-        }
-    }
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "created": created, "errors": errors })),
-    ))
+    Ok(Json(json!({
+        "id": id,
+        "target": target,
+        "target_type": target_type,
+        "status": "suppressed",
+    })))
 }
 
-#[cfg(test)]
-mod notification_channel_import_export_tests {
-    use super::*;
+/// Remove an entry from the suppression list.
+/// DELETE /v1/admin/notifications/suppress/:id
+pub async fn remove_suppression(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let deleted: Option<String> = sqlx::query_scalar(
+        "DELETE FROM suppression_lists WHERE id = $1 RETURNING target",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
 
-    #[test]
-    fn redact_secrets_replaces_secret_field() {
-        let config = json!({ "url": "https://example.com", "secret": "s3cr3t" });
-        let redacted = redact_secrets(config);
-        assert_eq!(redacted["secret"], "***REDACTED***");
-        assert_eq!(redacted["url"], "https://example.com");
-    }
-
-    #[test]
-    fn redact_secrets_replaces_password_field() {
-        let config = json!({ "smtp_host": "mail.example.com", "smtp_password": "hunter2" });
-        let redacted = redact_secrets(config);
-        assert_eq!(redacted["smtp_password"], "***REDACTED***");
-        assert_eq!(redacted["smtp_host"], "mail.example.com");
-    }
-
-    #[test]
-    fn redact_secrets_replaces_api_key_field() {
-        let config = json!({ "api_key": "abc123", "endpoint": "https://api.example.com" });
-        let redacted = redact_secrets(config);
-        assert_eq!(redacted["api_key"], "***REDACTED***");
-        assert_eq!(redacted["endpoint"], "https://api.example.com");
-    }
-
-    #[test]
-    fn redact_secrets_leaves_non_secret_fields_intact() {
-        let config = json!({ "url": "https://example.com", "retries": 3 });
-        let redacted = redact_secrets(config);
-        assert_eq!(redacted["url"], "https://example.com");
-        assert_eq!(redacted["retries"], 3);
-    }
-
-    #[test]
-    fn export_import_roundtrip_preserves_non_secret_fields() {
-        let original = json!({
-            "name": "Test Webhook",
-            "channel_type": "webhook",
-            "config": { "url": "https://example.com/hook", "secret": "topsecret" },
-            "retry_policy": { "max_attempts": 3 }
-        });
-
-        // Simulate export (redact secrets).
-        let exported = json!({
-            "name": original["name"].clone(),
-            "channel_type": original["channel_type"].clone(),
-            "config": redact_secrets(original["config"].clone()),
-            "retry_policy": original["retry_policy"].clone(),
-        });
-
-        assert_eq!(exported["name"], "Test Webhook");
-        assert_eq!(exported["channel_type"], "webhook");
-        assert_eq!(exported["config"]["url"], "https://example.com/hook");
-        assert_eq!(exported["config"]["secret"], "***REDACTED***");
-    }
-
-    #[test]
-    fn yaml_and_json_represent_same_structure() {
-        let payload = json!({ "channels": [{ "name": "ch1", "channel_type": "webhook" }] });
-        let yaml = serde_yaml::to_string(&payload).unwrap();
-        let roundtripped: Value = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(roundtripped["channels"][0]["name"], "ch1");
-    }
-}
-
-// ── Notification Channel Config Validation (#503) ─────────────────────────────
-
-#[cfg(test)]
-mod notification_channel_validation_tests {
-    use super::*;
-
-    #[test]
-    fn webhook_config_requires_url_field() {
-        let config_missing_url = json!({ "secret": "abc" });
-        let url = config_missing_url.get("url").and_then(Value::as_str);
-        assert!(url.is_none(), "url must be absent when not provided");
-    }
-
-    #[test]
-    fn webhook_config_with_url_field_passes_extraction() {
-        let config = json!({ "url": "https://hooks.example.com/notify", "secret": "abc" });
-        let url = config.get("url").and_then(Value::as_str);
-        assert_eq!(url, Some("https://hooks.example.com/notify"));
-    }
-
-    #[test]
-    fn email_config_requires_smtp_host() {
-        let config = json!({ "smtp_port": 587 });
-        let host = config.get("smtp_host").and_then(Value::as_str);
-        assert!(host.is_none());
-    }
-
-    #[test]
-    fn email_config_smtp_port_defaults_to_587_when_absent() {
-        let config = json!({ "smtp_host": "mail.example.com" });
-        let port = config.get("smtp_port").and_then(Value::as_u64).unwrap_or(587) as u16;
-        assert_eq!(port, 587);
-    }
-
-    #[test]
-    fn email_config_smtp_port_uses_provided_value() {
-        let config = json!({ "smtp_host": "mail.example.com", "smtp_port": 465 });
-        let port = config.get("smtp_port").and_then(Value::as_u64).unwrap_or(587) as u16;
-        assert_eq!(port, 465);
-    }
-
-    #[test]
-    fn sms_channel_type_skips_network_validation() {
-        // validate_channel_config matches on channel_type; sms hits the wildcard arm.
-        let channel_type = "sms";
-        let is_network_validated = matches!(channel_type, "webhook" | "email");
-        assert!(!is_network_validated);
+    match deleted {
+        Some(target) => Ok(Json(json!({ "id": id, "target": target, "status": "removed" }))),
+        None => Err(AppError::NotFound),
     }
 }
