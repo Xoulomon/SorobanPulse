@@ -187,6 +187,11 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record an email bounce reported via the bounce webhook (Issue #484)
+pub fn record_email_bounce() {
+    m::counter!("soroban_pulse_email_bounces_total").increment(1);
+}
+
 /// Record a full-text search query duration
 pub fn record_search_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_search_query_duration_seconds").record(duration.as_secs_f64());
@@ -354,6 +359,24 @@ pub fn spawn_memory_collector() {
             update_process_memory_bytes();
         }
     });
+}
+
+/// #513: Record notification delivery latency per channel
+pub fn record_notification_delivery_latency(channel: &str, latency_seconds: f64) {
+    m::histogram!(
+        "soroban_pulse_notification_delivery_latency_seconds",
+        "channel" => channel.to_string()
+    )
+    .record(latency_seconds);
+}
+
+/// #514: Update notification rate per minute gauge per channel
+pub fn update_notification_rate_per_minute(channel: &str, rate: f64) {
+    m::gauge!(
+        "soroban_pulse_notification_rate_per_minute",
+        "channel" => channel.to_string()
+    )
+    .set(rate);
 }
 
 #[cfg(test)]

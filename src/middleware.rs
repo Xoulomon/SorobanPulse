@@ -74,8 +74,8 @@ pub async fn auth_middleware(
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let path = req.uri().path();
 
-    // Exclude /health and /healthz/*
-    if path == "/health" || path.starts_with("/healthz/") {
+    // Exclude /health, /healthz/* and the public unsubscribe endpoint (#483).
+    if path == "/health" || path.starts_with("/healthz/") || path == "/unsubscribe" {
         return Ok(next.run(req).await);
     }
 

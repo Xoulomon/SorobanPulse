@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Email unsubscribe links (CAN-SPAM / GDPR): every notification email now includes a per-recipient unsubscribe link and `List-Unsubscribe` header, a public `/unsubscribe` endpoint to opt out, and `EMAIL_PUBLIC_BASE_URL` to configure the link's base URL. Opted-out recipients are skipped on subsequent sends.
 - Email notification feature for event alerts with batching (one email per minute maximum)
 - Email configuration via `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USER`, `EMAIL_SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, and `EMAIL_CONTRACT_FILTER` environment variables
 - Email notifications can be filtered by contract ID using `EMAIL_CONTRACT_FILTER`

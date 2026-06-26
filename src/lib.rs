@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod bloom_filter;
 pub mod config;
+pub mod content_filter;
 pub mod db;
 pub mod email;
 pub mod encryption;
@@ -14,7 +15,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod models;
 pub mod normalizer;
-pub mod notification_admin;
+pub mod notification_dedup;
 pub mod pruner;
 pub mod pubsub;
 pub mod queue_publisher;

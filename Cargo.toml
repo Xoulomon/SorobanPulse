@@ -9,6 +9,7 @@ tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json", "migrate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -33,6 +34,8 @@ metrics-exporter-prometheus = "0.14"
 axum-extra = { version = "0.9", features = ["typed-header"] }
 async-trait = "0.1"
 tower_governor = { version = "0.8", features = ["axum"] }
+# Token-bucket rate limiting for per-channel notification throttling (Issue #476).
+governor = "0.10"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
@@ -65,7 +68,19 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 google-cloud-pubsub = { version = "0.33", optional = true }
 
 # Email notifications
-lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "dkim"] }
+
+# DNS resolver for SPF record checks (Issue #486)
+hickory-resolver = "0.24"
+
+# Issue #480: Multi-language email notification templates (Handlebars)
+handlebars = "5"
+
+# Issue #482: HTML email notification templates (Handlebars)
+handlebars = "5"
+
+# Issue #479: cron expression parsing for custom notification schedules
+cron = "0.12"
 
 # JSON Schema validation
 jsonschema = "0.18"

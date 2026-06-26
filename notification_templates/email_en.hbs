@@ -1,0 +1,8 @@
+Soroban Pulse indexed {{event_count}} new event(s) in the last minute.
+
+{{#each contracts}}Contract: {{contract_id}}
+  Events: {{event_count}}
+{{#each events}}  - Type: {{event_type}}, Ledger: {{ledger}}, TxHash: {{tx_hash}}
+{{/each}}{{#if more_count}}  ... and {{more_count}} more event(s)
+{{/if}}
+{{/each}}

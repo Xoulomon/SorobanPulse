@@ -68,6 +68,8 @@ pub struct AppState {
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
     /// Per-IP SSE connection counts (Issue #453)
     pub sse_connections_per_ip: Arc<DashMap<String, usize>>,
+    /// SHA-256 hex of SUPER_ADMIN_API_KEY, grants unrestricted channel access (#508).
+    pub super_admin_key_hash: Option<String>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -82,6 +84,7 @@ pub struct AppState {
         handlers::health,
         handlers::health_live,
         handlers::health_ready,
+        handlers::email_bounce_webhook,
         handlers::status,
         handlers::get_events,
         handlers::get_event_stats,
@@ -292,6 +295,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .max_capacity(1)
         .time_to_live(std::time::Duration::from_secs(config.stats_cache_ttl_secs))
         .build();
+    let super_admin_key_hash = std::env::var("SUPER_ADMIN_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|k| crate::middleware::hash_api_key(&k));
+
     let app_state = AppState {
         pool,
         read_pool,
@@ -312,6 +320,7 @@ pub fn create_router_with_tx_and_tenant_map(
         stats_cache,
         shutdown_rx,
         sse_connections_per_ip: Arc::new(DashMap::new()),
+        super_admin_key_hash,
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -392,6 +401,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/mask-events", axum::routing::post(handlers::start_mask_events))
         .route("/admin/mask-events/{job_id}", get(handlers::get_mask_job_status))
+        .route("/admin/notifications/channels", axum::routing::post(handlers::create_notification_channel))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi).get(handlers::get_contract_abi))
         .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
         .route("/admin/events/contract/{contract_id}", axum::routing::delete(handlers::delete_contract_events))
@@ -399,18 +409,21 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
         .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
+        .route("/notifications/email/bounce", axum::routing::post(handlers::email_bounce_webhook))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
         .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
-        // #495 Maintenance windows
-        .route("/admin/maintenance-windows", axum::routing::post(crate::notification_admin::create_maintenance_window).get(crate::notification_admin::list_maintenance_windows))
-        .route("/admin/maintenance-windows/{id}", axum::routing::delete(crate::notification_admin::delete_maintenance_window))
-        // #496 Notification audit log
-        .route("/admin/notifications/audit-log", get(crate::notification_admin::get_audit_log))
-        // #497 Template versioning
-        .route("/admin/notification-templates", axum::routing::post(crate::notification_admin::create_template))
-        .route("/admin/notification-templates/{name}/versions", get(crate::notification_admin::list_template_versions))
-        .route("/admin/notification-templates/{name}/activate/{version}", axum::routing::post(crate::notification_admin::activate_template_version));
+        // Issue #487: email open tracking (public – email clients fetch the pixel)
+        .route("/notifications/email/track/{token}", get(handlers::track_email_open))
+        // Issue #487: email open stats (admin)
+        .route("/admin/notifications/email/stats", get(handlers::get_email_stats))
+        // Issue #488: email click tracking (public – email link redirect)
+        .route("/notifications/email/click/{token}", get(handlers::track_email_click))
+        // Issue #489: A/B test results (admin)
+        .route("/admin/notifications/email/ab-test/results", get(handlers::get_ab_test_results))
+        // Issue #490: suppression list management (admin)
+        .route("/admin/notifications/suppress", axum::routing::post(handlers::add_suppression))
+        .route("/admin/notifications/suppress/{id}", axum::routing::delete(handlers::remove_suppression));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
@@ -451,10 +464,13 @@ pub fn create_router_with_tx_and_tenant_map(
         ));
 
     // Health endpoints — exempt from rate limiting.
+    // The unsubscribe endpoint is public (reached from email links) and must
+    // bypass both auth and rate limiting (Issue #483).
     let health_routes = Router::new()
         .route("/health", get(handlers::health))
         .route("/healthz/live", get(handlers::health_live))
         .route("/healthz/ready", get(handlers::health_ready))
+        .route("/unsubscribe", get(handlers::unsubscribe))
         .route("/metrics", get(handlers::metrics));
 
     // All other routes — subject to rate limiting.
