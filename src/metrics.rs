@@ -187,10 +187,9 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
-/// Record a notification skipped because the event was already notified
-/// (deduplication, issue #478).
-pub fn record_notification_deduplicated() {
-    m::counter!("soroban_pulse_notification_deduplicated_total").increment(1);
+/// Record an email bounce reported via the bounce webhook (Issue #484)
+pub fn record_email_bounce() {
+    m::counter!("soroban_pulse_email_bounces_total").increment(1);
 }
 
 /// Record a full-text search query duration

@@ -53,6 +53,40 @@ pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoRespo
     let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
     Json(json!({"job_id": job_id, "status": status, "progress": 42}))
 }
+
+/// Issue #480: List the available multi-language email notification templates.
+///
+/// `GET /v1/admin/notification-templates`
+///
+/// Returns the languages for which a bundled Handlebars template exists, the
+/// configured default language, and the on-disk template path for each entry.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notification-templates",
+    tag = "admin",
+    responses(
+        (status = 200, description = "List of available notification templates")
+    )
+)]
+pub async fn list_notification_templates() -> impl IntoResponse {
+    let templates: Vec<Value> = crate::email::SUPPORTED_LANGUAGES
+        .iter()
+        .map(|lang| {
+            json!({
+                "language": lang,
+                "engine": "handlebars",
+                "format": "text",
+                "file": format!("notification_templates/email_{lang}.hbs"),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "default_language": "en",
+        "count": templates.len(),
+        "templates": templates,
+    }))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -537,6 +571,65 @@ pub async fn health_live() -> (StatusCode, Json<Value>) {
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let (status, body) = build_health_response(&state).await;
     (status, Json(body))
+}
+
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
 }
 
 #[utoipa::path(
@@ -10166,4 +10259,250 @@ async fn handle_ws_connection(
     
     let count = ws_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::metrics::update_ws_connections(count);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #487 – Email open tracking
+// ---------------------------------------------------------------------------
+
+/// 1×1 transparent GIF used as the tracking pixel.
+const TRACKING_PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x02, 0x00, 0x3b,
+];
+
+/// Record an email open event and return the 1×1 tracking pixel.
+/// GET /v1/notifications/email/track/:token
+pub async fn track_email_open(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_opens SET opened_at = NOW()
+                WHERE token = $1 AND opened_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_open();
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/gif")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("pragma", "no-cache")
+        .body(Body::from(TRACKING_PIXEL_GIF.to_vec()))
+        .unwrap()
+}
+
+/// Return email open-rate statistics.
+/// GET /v1/admin/notifications/email/stats
+pub async fn get_email_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
+    let opened: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens WHERE opened_at IS NOT NULL",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
+    let open_rate = if total == 0 {
+        0.0_f64
+    } else {
+        opened as f64 / total as f64 * 100.0
+    };
+
+    Ok(Json(json!({
+        "total_sent": total,
+        "total_opened": opened,
+        "open_rate_pct": open_rate,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #488 – Email click tracking
+// ---------------------------------------------------------------------------
+
+/// Record an email link click and redirect to the destination URL.
+/// GET /v1/notifications/email/click/:token
+pub async fn track_email_click(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let dest: Option<String> = sqlx::query_scalar(
+        "SELECT destination_url FROM email_clicks WHERE token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let pool = state.pool.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_clicks SET clicked_at = NOW()
+                WHERE token = $1 AND clicked_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token_clone)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_click();
+        }
+    });
+
+    match dest {
+        Some(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("click token not found"))
+            .unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #489 – A/B test results
+// ---------------------------------------------------------------------------
+
+/// Return A/B test delivery and open-rate statistics.
+/// GET /v1/admin/notifications/email/ab-test/results
+pub async fn get_ab_test_results(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query(
+        "SELECT d.ab_template,
+                COUNT(d.id)                               AS deliveries,
+                COUNT(o.id) FILTER (WHERE o.opened_at IS NOT NULL) AS opens
+         FROM email_deliveries d
+         LEFT JOIN email_opens o
+               ON o.email_notification_id = d.email_notification_id
+              AND o.recipient = d.recipient
+         WHERE d.ab_template IS NOT NULL
+         GROUP BY d.ab_template
+         ORDER BY d.ab_template",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let template: Option<String> = row.try_get("ab_template").ok();
+            let deliveries: i64 = row.try_get("deliveries").unwrap_or(0);
+            let opens: i64 = row.try_get("opens").unwrap_or(0);
+            let open_rate = if deliveries == 0 {
+                0.0_f64
+            } else {
+                opens as f64 / deliveries as f64 * 100.0
+            };
+            json!({
+                "template": template,
+                "deliveries": deliveries,
+                "opens": opens,
+                "open_rate_pct": open_rate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #490 – Suppression list management
+// ---------------------------------------------------------------------------
+
+/// Add an email address or webhook URL to the suppression list.
+/// POST /v1/admin/notifications/suppress
+pub async fn add_suppression(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target' field".to_string()))?
+        .to_string();
+
+    let target_type = body
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target_type' field".to_string()))?
+        .to_string();
+
+    if target_type != "email" && target_type != "webhook" {
+        return Err(AppError::Validation(
+            "target_type must be 'email' or 'webhook'".to_string(),
+        ));
+    }
+
+    let reason = body.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO suppression_lists (target, target_type, reason, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (target, target_type) DO UPDATE \
+             SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at \
+         RETURNING id",
+    )
+    .bind(&target)
+    .bind(&target_type)
+    .bind(&reason)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "id": id,
+        "target": target,
+        "target_type": target_type,
+        "status": "suppressed",
+    })))
+}
+
+/// Remove an entry from the suppression list.
+/// DELETE /v1/admin/notifications/suppress/:id
+pub async fn remove_suppression(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let deleted: Option<String> = sqlx::query_scalar(
+        "DELETE FROM suppression_lists WHERE id = $1 RETURNING target",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match deleted {
+        Some(target) => Ok(Json(json!({ "id": id, "target": target, "status": "removed" }))),
+        None => Err(AppError::NotFound),
+    }
 }
