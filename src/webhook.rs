@@ -247,6 +247,119 @@ pub async fn deliver_with_retry_policy(
     }
 }
 
+/// Deliver with failover: if the primary URL fails, attempt the failover URL (#499).
+/// Returns true if delivered (primary or failover), false if both failed.
+pub async fn deliver_with_failover(
+    client: Client,
+    primary_url: String,
+    primary_secret: Option<String>,
+    failover_url: Option<String>,
+    failover_secret: Option<String>,
+    event: SorobanEvent,
+    pool: Option<&sqlx::PgPool>,
+    retry_policy: &crate::retry_policy::RetryPolicy,
+) -> bool {
+    let body = match serde_json::to_vec(&event) {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize event for webhook delivery");
+            return false;
+        }
+    };
+
+    let primary_sig = primary_secret.as_deref().map(|s| sign_payload(s, &body));
+
+    let primary_result = retry_policy.execute_with_retry(|attempt| {
+        let client = client.clone();
+        let url = primary_url.clone();
+        let body = body.clone();
+        let sig = primary_sig.clone();
+        async move {
+            let mut req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body);
+            if let Some(ref s) = sig {
+                req = req.header("X-Signature-256", format!("sha256={s}"));
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(url = %url, attempt = attempt, "Webhook delivered (primary)");
+                    Ok(())
+                }
+                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                Err(e) => Err(format!("Request error: {e}")),
+            }
+        }
+    }).await;
+
+    if primary_result.is_ok() {
+        return true;
+    }
+
+    warn!(
+        primary_url = %primary_url,
+        "Primary webhook delivery failed, attempting failover"
+    );
+
+    // Attempt failover if configured
+    if let Some(f_url) = failover_url {
+        metrics::record_notification_failover("webhook");
+        let f_sig = failover_secret.as_deref().map(|s| sign_payload(s, &body));
+
+        let failover_result = retry_policy.execute_with_retry(|attempt| {
+            let client = client.clone();
+            let url = f_url.clone();
+            let body = body.clone();
+            let sig = f_sig.clone();
+            async move {
+                let mut req = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(body);
+                if let Some(ref s) = sig {
+                    req = req.header("X-Signature-256", format!("sha256={s}"));
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        info!(url = %url, attempt = attempt, "Webhook delivered (failover)");
+                        Ok(())
+                    }
+                    Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                    Err(e) => Err(format!("Request error: {e}")),
+                }
+            }
+        }).await;
+
+        if failover_result.is_ok() {
+            return true;
+        }
+        error!(failover_url = %f_url, "Failover webhook delivery also failed");
+    }
+
+    // Record DLQ and metric
+    if let Some(pool) = pool {
+        let payload = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));
+        let next_retry = chrono::Utc::now() + chrono::Duration::seconds(60);
+        if let Err(e) = sqlx::query(
+            "INSERT INTO webhook_failures (url, payload, attempts, last_error, next_retry_at)
+             VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(&primary_url)
+        .bind(payload)
+        .bind(retry_policy.max_attempts as i32)
+        .bind("Primary and failover both failed")
+        .bind(next_retry)
+        .execute(pool)
+        .await
+        {
+            error!(error = %e, "Failed to insert webhook failure into DLQ");
+        }
+    }
+    metrics::record_webhook_failure();
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
