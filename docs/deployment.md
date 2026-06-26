@@ -780,61 +780,53 @@ Expected output on PostgreSQL 14+:
 
 ---
 
-## Email Deliverability (SPF, DKIM, DMARC)
+## Email Bounce Handling
 
-Notification emails are only useful if they reach the inbox. The three standard
-sender-authentication mechanisms below should all be configured for the sending
-domain (the domain of `EMAIL_FROM`). Misconfiguration is the most common cause
-of alerts landing in spam or being rejected outright.
+The email notification system suppresses addresses that have bounced (invalid
+mailbox, mailbox full, etc.). Continuing to send to bouncing addresses harms
+the sender's reputation and reduces deliverability for everyone, so bounced
+recipients are stored in the `email_bounces` table and skipped on future sends.
 
-### SPF (Sender Policy Framework)
+### Bounce webhook endpoint
 
-SPF lists the hosts allowed to send mail for your domain. Publish a TXT record
-at the domain apex:
-
-```
-example.com.  IN  TXT  "v=spf1 include:_spf.your-provider.com -all"
-```
-
-Replace `include:_spf.your-provider.com` with the include provided by your email
-provider (SendGrid, SES, Mailgun, your own relay, etc.). Use `-all` (hard fail)
-once you are confident every legitimate source is listed; `~all` (soft fail) is
-a safer starting point.
-
-On startup the service performs a DNS TXT lookup for the `EMAIL_FROM` domain and
-logs a warning (`No SPF record found for sending domain`) if no `v=spf1` record
-is present. Each failed check increments the
-`soroban_pulse_email_spf_check_failed_total` Prometheus counter. The check is
-best-effort and never blocks startup or delivery.
-
-### DKIM (DomainKeys Identified Mail)
-
-DKIM cryptographically signs each message. Publish the public key as a TXT
-record at `<selector>._domainkey.<domain>`:
+Configure your email provider to POST bounce notifications to:
 
 ```
-pulse._domainkey.example.com.  IN  TXT  "v=DKIM1; k=rsa; p=<base64-public-key>"
+POST /v1/notifications/email/bounce
 ```
 
-### DMARC (Domain-based Message Authentication, Reporting & Conformance)
+The endpoint accepts the native bounce payloads of the three common providers
+and extracts the bounced address(es) from each:
 
-DMARC tells receivers what to do when SPF/DKIM fail and where to send reports.
-Publish a TXT record at `_dmarc.<domain>`:
+- **SendGrid** — the [Event Webhook](https://docs.sendgrid.com/for-developers/tracking-events/getting-started-event-webhook)
+  posts a JSON array of events; `bounce`, `dropped` and `blocked` events are recorded.
+- **AWS SES** — bounce notifications delivered directly or via an SNS
+  subscription (the SNS `Message` envelope is unwrapped automatically).
+- **Mailgun** — both the modern `event-data` webhook and the legacy flat payload
+  (`failed` / `bounced` / `dropped` / `rejected`).
 
+The endpoint is under `/v1`, so it requires the standard `API_KEY` if one is
+configured. Most providers let you add a custom `Authorization` header (or an
+API key query parameter) to the webhook configuration — use that to authenticate.
+
+The response reports how many bounced addresses were received and recorded:
+
+```json
+{ "received": 1, "recorded": 1 }
 ```
-_dmarc.example.com.  IN  TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com; adkim=s; aspf=s"
+
+### Monitoring
+
+Each recorded bounce increments the `soroban_pulse_email_bounces_total`
+Prometheus counter. A rising bounce rate is an early warning that the recipient
+list contains stale addresses or that the sending domain's reputation is
+degrading.
+
+### Clearing a bounce
+
+If an address was suppressed in error (e.g. a transient mailbox-full bounce),
+delete its row to resume delivery:
+
+```sql
+DELETE FROM email_bounces WHERE email = 'user@example.com';
 ```
-
-Start with `p=none` to collect reports without affecting delivery, then move to
-`p=quarantine` and finally `p=reject` as confidence grows.
-
-### Deliverability checklist
-
-- [ ] `EMAIL_FROM` uses a domain you control (not a free mailbox provider).
-- [ ] **SPF** TXT record published and includes every sending source.
-- [ ] **DKIM** key generated, `DKIM_PRIVATE_KEY_PATH` / `DKIM_SELECTOR` set, and the public key published in DNS.
-- [ ] **DMARC** record published (`p=none` → `quarantine` → `reject`).
-- [ ] Forward and reverse DNS (PTR) of the sending host match.
-- [ ] Startup logs show no `No SPF record found` warning.
-- [ ] `soroban_pulse_email_spf_check_failed_total` stays at 0.
-- [ ] A test email passes inspection at a tool such as [mail-tester.com](https://www.mail-tester.com/).

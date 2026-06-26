@@ -243,6 +243,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref from) = config.email_from {
             if !config.email_to.is_empty() {
                 let email_rx = event_tx.subscribe();
+                // Base URL for unsubscribe links (Issue #483): honor the
+                // configured public URL, otherwise fall back to localhost:<port>.
+                let base_url = config
+                    .email_public_base_url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{}", config.port));
                 let notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
@@ -253,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
                     config.email_contract_filter.clone(),
                     config.email_retry_policy.clone(),
                     pool.clone(),
+                    base_url,
                 );
 
                 info!(

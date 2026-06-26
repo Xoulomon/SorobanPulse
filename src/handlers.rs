@@ -539,6 +539,65 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Va
     (status, Json(body))
 }
 
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/v1/status",

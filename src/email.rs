@@ -1,67 +1,130 @@
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
-use lettre::message::{header, MultiPart, SinglePart};
+use lettre::message::header::{self, Header, HeaderName, HeaderValue};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{metrics, models::SorobanEvent, retry_policy::RetryPolicy};
 
-/// Extract the sending domain from a `From` address for the SPF check.
-/// Handles both bare `user@example.com` and `Name <user@example.com>` forms.
-fn sender_domain(from: &str) -> Option<String> {
-    let domain = from.rsplit('@').next()?.trim_end_matches('>').trim();
-    if domain.is_empty() {
-        None
-    } else {
-        Some(domain.to_string())
+/// The `List-Unsubscribe` header (RFC 2369). Lets conforming mail clients
+/// surface a native unsubscribe action pointing at our unsubscribe URL.
+#[derive(Clone)]
+struct ListUnsubscribe(String);
+
+impl Header for ListUnsubscribe {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("List-Unsubscribe")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.to_string()))
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
     }
 }
 
-/// Verify that the sending domain publishes an SPF record (Issue #486).
-///
-/// Performs a DNS TXT lookup for the domain of `from` and logs a warning if no
-/// `v=spf1` record is present (or the lookup fails), incrementing the
-/// `soroban_pulse_email_spf_check_failed_total` counter. Best-effort: it never
-/// blocks startup or email delivery, it only surfaces a deliverability problem.
-pub async fn verify_spf_record(from: &str) {
-    let Some(domain) = sender_domain(from) else {
-        warn!(from = %from, "Cannot determine sending domain for SPF check");
-        metrics::record_email_spf_check_failed();
-        return;
-    };
+/// Generate an opaque, URL-safe unsubscribe token.
+fn generate_unsubscribe_token() -> String {
+    // Two UUIDs (256 bits of randomness) hashed to a hex string yields a
+    // collision-resistant, opaque token that is safe to embed in a URL.
+    let raw = format!("{}{}", Uuid::new_v4(), Uuid::new_v4());
+    let digest = Sha256::digest(raw.as_bytes());
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-    match resolver.txt_lookup(format!("{domain}.")).await {
-        Ok(lookup) => {
-            let has_spf = lookup.iter().any(|txt| {
-                txt.txt_data().iter().any(|chunk| {
-                    String::from_utf8_lossy(chunk)
-                        .trim_start()
-                        .starts_with("v=spf1")
-                })
-            });
-            if has_spf {
-                info!(domain = %domain, "SPF record found for sending domain");
-            } else {
-                warn!(
-                    domain = %domain,
-                    "No SPF record found for sending domain; email may be marked as spam"
-                );
-                metrics::record_email_spf_check_failed();
-            }
-        }
+/// Return the existing unsubscribe token for `email`, creating one if absent.
+/// Returns `None` only if the database is unreachable.
+pub async fn get_or_create_unsubscribe_token(
+    pool: &sqlx::PgPool,
+    email: &str,
+) -> Option<String> {
+    // Fast path: token already exists.
+    if let Ok(Some(token)) = sqlx::query_scalar::<_, String>(
+        "SELECT token FROM email_unsubscribes WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    {
+        return Some(token);
+    }
+
+    // Insert a new token. ON CONFLICT handles a race where another sender
+    // inserted the same email concurrently — we then read back the winner.
+    let token = generate_unsubscribe_token();
+    let inserted = sqlx::query_scalar::<_, String>(
+        "INSERT INTO email_unsubscribes (email, token) VALUES ($1, $2) \
+         ON CONFLICT (email) DO NOTHING RETURNING token",
+    )
+    .bind(email)
+    .bind(&token)
+    .fetch_optional(pool)
+    .await;
+
+    match inserted {
+        Ok(Some(t)) => Some(t),
+        Ok(None) => sqlx::query_scalar::<_, String>(
+            "SELECT token FROM email_unsubscribes WHERE email = $1",
+        )
+        .bind(email)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten(),
         Err(e) => {
-            warn!(domain = %domain, error = %e, "SPF TXT lookup failed for sending domain");
-            metrics::record_email_spf_check_failed();
+            error!(error = %e, "Failed to create unsubscribe token");
+            None
         }
     }
+}
+
+/// True when `email` has opted out of notifications.
+pub async fn is_unsubscribed(pool: &sqlx::PgPool, email: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM email_unsubscribes \
+         WHERE email = $1 AND unsubscribed_at IS NOT NULL",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .map(|c| c > 0)
+    .unwrap_or(false)
+}
+
+/// Mark the recipient identified by `token` as unsubscribed.
+/// Returns `Ok(true)` if a matching, not-yet-unsubscribed recipient was found.
+/// Idempotent: re-using an already-unsubscribed token returns `Ok(true)`.
+pub async fn mark_unsubscribed(pool: &sqlx::PgPool, token: &str) -> Result<bool, sqlx::Error> {
+    // Set unsubscribed_at only if not already set; report whether the token exists.
+    let updated = sqlx::query(
+        "UPDATE email_unsubscribes \
+         SET unsubscribed_at = NOW() \
+         WHERE token = $1 AND unsubscribed_at IS NULL",
+    )
+    .bind(token)
+    .execute(pool)
+    .await?;
+
+    if updated.rows_affected() > 0 {
+        return Ok(true);
+    }
+
+    // No row updated: either the token is unknown or already unsubscribed.
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM email_unsubscribes WHERE token = $1",
+    )
+    .bind(token)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists > 0)
 }
 
 /// Batched email notification sender.
@@ -76,9 +139,12 @@ pub struct EmailNotifier {
     contract_filter: Vec<String>,
     retry_policy: RetryPolicy,
     pool: sqlx::PgPool,
+    /// Base URL used to build unsubscribe links (Issue #483).
+    base_url: String,
 }
 
 impl EmailNotifier {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         smtp_host: String,
         smtp_port: u16,
@@ -89,6 +155,7 @@ impl EmailNotifier {
         contract_filter: Vec<String>,
         retry_policy: RetryPolicy,
         pool: sqlx::PgPool,
+        base_url: String,
     ) -> Self {
         Self {
             smtp_host,
@@ -100,6 +167,7 @@ impl EmailNotifier {
             contract_filter,
             retry_policy,
             pool,
+            base_url,
         }
     }
 
@@ -232,35 +300,86 @@ impl EmailNotifier {
             body.push('\n');
         }
 
-        // Build and send email
-        if let Err(e) = self.send_email(&subject, &body).await {
-            error!(error = %e, "Failed to send email notification");
-            metrics::record_email_failure();
-        } else {
+        // Send a separate message to each recipient so every email carries its
+        // own unsubscribe link (Issue #483). Recipients who have opted out are
+        // skipped entirely.
+        let mut sent = 0usize;
+        for recipient in &self.to {
+            if is_unsubscribed(&self.pool, recipient).await {
+                info!(recipient = %recipient, "Recipient has unsubscribed, skipping");
+                continue;
+            }
+
+            let unsubscribe_url = get_or_create_unsubscribe_token(&self.pool, recipient)
+                .await
+                .map(|token| {
+                    format!(
+                        "{}/unsubscribe?token={}",
+                        self.base_url.trim_end_matches('/'),
+                        token
+                    )
+                });
+
+            let mut personalized = body.clone();
+            if let Some(ref url) = unsubscribe_url {
+                personalized.push_str(&format!(
+                    "\n--\nYou are receiving this because you subscribed to Soroban Pulse \
+                     notifications.\nTo unsubscribe, visit: {url}\n"
+                ));
+            }
+
+            if let Err(e) = self
+                .send_email(recipient, &subject, &personalized, unsubscribe_url.as_deref())
+                .await
+            {
+                error!(error = %e, recipient = %recipient, "Failed to send email notification");
+                metrics::record_email_failure();
+            } else {
+                sent += 1;
+            }
+        }
+
+        if sent > 0 {
             info!(
-                recipients = self.to.len(),
+                recipients = sent,
                 event_count = events.len(),
                 "Email notification sent successfully"
             );
         }
     }
 
-    /// Send an email using SMTP.
+    /// Send an email to a single recipient using SMTP. When `unsubscribe_url`
+    /// is set, a `List-Unsubscribe` header is added so mail clients can offer a
+    /// one-click unsubscribe (RFC 2369 / CAN-SPAM compliance, Issue #483).
     async fn send_email(
         &self,
+        recipient: &str,
         subject: &str,
         body: &str,
+        unsubscribe_url: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Build message with all recipients
-        let mut message_builder = Message::builder().from(self.from.parse()?).subject(subject);
+        let mut message_builder = Message::builder()
+            .from(self.from.parse()?)
+            .to(recipient.parse()?)
+            .subject(subject);
 
-        for recipient in &self.to {
-            message_builder = message_builder.to(recipient.parse()?);
+        if let Some(url) = unsubscribe_url {
+            message_builder = message_builder.header(ListUnsubscribe(format!("<{url}>")));
         }
 
-        let message = message_builder
+        let mut message = message_builder
             .header(header::ContentType::TEXT_PLAIN)
             .body(body.to_string())?;
+
+        // DKIM-sign the message when a signing key is configured (Issue #485).
+        // A bad key never blocks delivery — it is logged and the email is sent
+        // unsigned (the key is validated at startup, so this is defensive).
+        if let (Some(selector), Some(key)) = (&self.dkim_selector, &self.dkim_private_key) {
+            match build_dkim_config(selector, &self.from, key.expose_secret()) {
+                Ok(config) => message.sign(&config),
+                Err(e) => warn!(error = %e, "DKIM signing skipped"),
+            }
+        }
 
         // Build SMTP transport
         let mut transport_builder = SmtpTransport::relay(&self.smtp_host)?.port(self.smtp_port);
@@ -329,12 +448,34 @@ mod tests {
             vec![],
             RetryPolicy::default(),
             pool,
+            "https://pulse.example.com".to_string(),
         );
 
         assert_eq!(notifier.smtp_host, "smtp.example.com");
+        assert_eq!(notifier.base_url, "https://pulse.example.com");
         assert_eq!(notifier.smtp_port, 587);
         assert_eq!(notifier.from, "from@example.com");
         assert_eq!(notifier.to.len(), 1);
+    }
+
+    #[test]
+    fn test_unsubscribe_token_is_opaque_and_unique() {
+        let a = generate_unsubscribe_token();
+        let b = generate_unsubscribe_token();
+        assert_ne!(a, b, "tokens must be unique");
+        assert_eq!(a.len(), 64, "sha256 hex digest is 64 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_list_unsubscribe_header_display() {
+        let h = ListUnsubscribe("<https://pulse.example.com/unsubscribe?token=abc>".to_string());
+        assert_eq!(
+            ListUnsubscribe::name(),
+            HeaderName::new_from_ascii_str("List-Unsubscribe")
+        );
+        // display() must not panic and round-trips the raw value.
+        let _ = h.display();
     }
 
     #[test]

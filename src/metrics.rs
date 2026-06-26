@@ -187,9 +187,9 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
-/// Record a failed SPF record check for the sending domain (Issue #486)
-pub fn record_email_spf_check_failed() {
-    m::counter!("soroban_pulse_email_spf_check_failed_total").increment(1);
+/// Record an email bounce reported via the bounce webhook (Issue #484)
+pub fn record_email_bounce() {
+    m::counter!("soroban_pulse_email_bounces_total").increment(1);
 }
 
 /// Record a full-text search query duration

@@ -8,6 +8,7 @@ The email notification feature allows operators to receive email alerts when spe
 - **Contract Filtering**: Optional filtering to only receive notifications for specific contracts
 - **SMTP Support**: Works with any SMTP server (Gmail, SendGrid, AWS SES, etc.)
 - **Multiple Recipients**: Send notifications to multiple email addresses
+- **Unsubscribe Links**: Every email carries a per-recipient unsubscribe link and a `List-Unsubscribe` header (CAN-SPAM / GDPR). Opted-out recipients are skipped on subsequent sends.
 - **Secure**: SMTP credentials are never logged or exposed in metrics
 
 ## Configuration
@@ -26,6 +27,17 @@ Email notifications are configured via environment variables:
 - `EMAIL_SMTP_USER`: SMTP authentication username (required by most servers)
 - `EMAIL_SMTP_PASSWORD`: SMTP authentication password (required by most servers)
 - `EMAIL_CONTRACT_FILTER`: Comma-separated list of contract IDs to filter notifications
+- `EMAIL_PUBLIC_BASE_URL`: Public base URL used to build unsubscribe links (e.g. `https://pulse.example.com`). Defaults to `http://localhost:<PORT>` when unset.
+
+## Unsubscribing
+
+Each notification email includes an unsubscribe link of the form
+`<EMAIL_PUBLIC_BASE_URL>/unsubscribe?token=<token>` and a matching
+`List-Unsubscribe` header. The `/unsubscribe` endpoint is public (no API key
+required). Visiting it records the recipient's opt-out, and no further emails
+are sent to that address. The action is idempotent — re-visiting the link is
+safe. Set `EMAIL_PUBLIC_BASE_URL` to a publicly reachable URL so recipients can
+actually open the link.
 
 ## Example Configuration
 
